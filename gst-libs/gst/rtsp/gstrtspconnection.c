@@ -3051,6 +3051,8 @@ struct _GstRTSPWatch
   guint id;
   GMutex *mutex;
   GQueue *messages;
+  guint queued_bytes;
+
   guint8 *write_data;
   guint write_off;
   guint write_size;
@@ -3201,6 +3203,8 @@ gst_rtsp_source_dispatch (GSource * source, GSourceFunc callback G_GNUC_UNUSED,
         rec = g_queue_pop_tail (watch->messages);
         if (rec == NULL)
           break;
+
+        watch->queued_bytes -= rec->size;
 
         watch->write_off = 0;
         watch->write_data = rec->data;
@@ -3362,6 +3366,7 @@ gst_rtsp_watch_new (GstRTSPConnection * conn,
 
   result->mutex = g_mutex_new ();
   result->messages = g_queue_new ();
+  result->queued_bytes = 0;
 
   result->readfd.fd = -1;
   result->writefd.fd = -1;
@@ -3477,6 +3482,8 @@ gst_rtsp_watch_write_data (GstRTSPWatch * watch, const guint8 * data,
 
   g_mutex_lock (watch->mutex);
 
+  GST_TRACE_OBJECT (watch, "rtsp queue length: %u bytes", watch->queued_bytes);
+
   /* try to send the message synchronously first */
   if (watch->messages->length == 0) {
     res = write_bytes (watch->writefd.fd, data, &off, size);
@@ -3486,6 +3493,15 @@ gst_rtsp_watch_write_data (GstRTSPWatch * watch, const guint8 * data,
       g_free ((gpointer) data);
       goto done;
     }
+  }
+
+  if (watch->queued_bytes > 1000000) {  // let's say 1 MB is the max queue length
+    GST_LOG_OBJECT (watch, "RTSP queue is full, dropping message");
+    res = GST_RTSP_OK;
+    if (id != NULL)
+      *id = 0;
+    g_free ((gpointer) data);
+    goto done;
   }
 
   /* make a record with the data and id for sending async */
@@ -3504,8 +3520,9 @@ gst_rtsp_watch_write_data (GstRTSPWatch * watch, const guint8 * data,
     rec->id = ++watch->id;
   } while (G_UNLIKELY (rec->id == 0));
 
-  /* add the record to a queue. FIXME we would like to have an upper limit here */
+  /* add the record to a queue. */
   g_queue_push_head (watch->messages, rec);
+  watch->queued_bytes += rec->size;
 
   /* make sure the main context will now also check for writability on the
    * socket */
@@ -3611,6 +3628,7 @@ gst_rtsp_watch_queue_data (GstRTSPWatch * watch, const guint8 * data,
 
   /* add the record to a queue. FIXME we would like to have an upper limit here */
   g_queue_push_head (watch->messages, rec);
+  watch->queued_bytes += rec->size;
 
   /* make sure the main context will now also check for writability on the
    * socket */
