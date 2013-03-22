@@ -113,6 +113,11 @@
 /* Debugging category */
 #include <gst/gstinfo.h>
 
+#include "gst/glib-compat-private.h"
+
+/* for XkbKeycodeToKeysym */
+#include <X11/XKBlib.h>
+
 GST_DEBUG_CATEGORY_EXTERN (gst_debug_ximagesink);
 #define GST_CAT_DEFAULT gst_debug_ximagesink
 
@@ -434,16 +439,23 @@ gst_ximagesink_ximage_new (GstXImageSink * ximagesink, GstCaps * caps)
         ZPixmap, NULL, &ximage->SHMInfo, ximage->width, ximage->height);
     if (!ximage->ximage || error_caught) {
       g_mutex_unlock (ximagesink->x_lock);
-      /* Reset error handler */
+
+      /* Reset error flag */
       error_caught = FALSE;
-      XSetErrorHandler (handler);
-      /* Push an error */
-      GST_ELEMENT_ERROR (ximagesink, RESOURCE, WRITE,
+
+      /* Push a warning */
+      GST_ELEMENT_WARNING (ximagesink, RESOURCE, WRITE,
           ("Failed to create output image buffer of %dx%d pixels",
               ximage->width, ximage->height),
           ("could not XShmCreateImage a %dx%d image",
               ximage->width, ximage->height));
-      goto beach;
+
+      /* Retry without XShm */
+      ximagesink->xcontext->use_xshm = FALSE;
+
+      /* Hold X mutex again to try without XShm */
+      g_mutex_lock (ximagesink->x_lock);
+      goto no_xshm;
     }
 
     /* we have to use the returned bytes_per_line for our shm size */
@@ -498,6 +510,7 @@ gst_ximagesink_ximage_new (GstXImageSink * ximagesink, GstCaps * caps)
     shmctl (ximage->SHMInfo.shmid, IPC_RMID, NULL);
 
   } else
+  no_xshm:
 #endif /* HAVE_XSHM */
   {
     guint allocsize;
@@ -1014,6 +1027,7 @@ gst_ximagesink_handle_xevents (GstXImageSink * ximagesink)
           KeyPressMask | KeyReleaseMask |
           ButtonPressMask | ButtonReleaseMask, &e)) {
     KeySym keysym;
+    const char *key_str = NULL;
 
     /* We lock only for the X function call */
     g_mutex_unlock (ximagesink->x_lock);
@@ -1038,25 +1052,20 @@ gst_ximagesink_handle_xevents (GstXImageSink * ximagesink)
       case KeyRelease:
         /* Key pressed/released over our window. We send upstream
            events for interactivity/navigation */
-        GST_DEBUG ("ximagesink key %d pressed over window at %d,%d",
-            e.xkey.keycode, e.xkey.x, e.xkey.x);
         g_mutex_lock (ximagesink->x_lock);
-        keysym = XKeycodeToKeysym (ximagesink->xcontext->disp,
-            e.xkey.keycode, 0);
-        g_mutex_unlock (ximagesink->x_lock);
+        keysym = XkbKeycodeToKeysym (ximagesink->xcontext->disp,
+            e.xkey.keycode, 0, 0);
         if (keysym != NoSymbol) {
-          char *key_str = NULL;
-
-          g_mutex_lock (ximagesink->x_lock);
           key_str = XKeysymToString (keysym);
-          g_mutex_unlock (ximagesink->x_lock);
-          gst_navigation_send_key_event (GST_NAVIGATION (ximagesink),
-              e.type == KeyPress ? "key-press" : "key-release", key_str);
-
         } else {
-          gst_navigation_send_key_event (GST_NAVIGATION (ximagesink),
-              e.type == KeyPress ? "key-press" : "key-release", "unknown");
+          key_str = "unknown";
         }
+        g_mutex_unlock (ximagesink->x_lock);
+        GST_DEBUG_OBJECT (ximagesink,
+            "key %d pressed over window at %d,%d (%s)",
+            e.xkey.keycode, e.xkey.x, e.xkey.y, key_str);
+        gst_navigation_send_key_event (GST_NAVIGATION (ximagesink),
+            e.type == KeyPress ? "key-press" : "key-release", key_str);
         break;
       default:
         GST_DEBUG_OBJECT (ximagesink, "ximagesink unhandled X event (%d)",
@@ -1163,8 +1172,13 @@ gst_ximagesink_manage_event_thread (GstXImageSink * ximagesink)
       GST_DEBUG_OBJECT (ximagesink, "run xevent thread, expose %d, events %d",
           ximagesink->handle_expose, ximagesink->handle_events);
       ximagesink->running = TRUE;
+#if !GLIB_CHECK_VERSION (2, 31, 0)
       ximagesink->event_thread = g_thread_create (
           (GThreadFunc) gst_ximagesink_event_thread, ximagesink, TRUE, NULL);
+#else
+      ximagesink->event_thread = g_thread_try_new ("ximagesink-events",
+          (GThreadFunc) gst_ximagesink_event_thread, ximagesink, NULL);
+#endif
     }
   } else {
     if (ximagesink->event_thread) {
@@ -1796,7 +1810,7 @@ gst_ximagesink_buffer_alloc (GstBaseSink * bsink, guint64 offset, guint size,
       " and offset %" G_GUINT64_FORMAT, size, caps, offset);
 
   /* assume we're going to alloc what was requested, keep track of
-   * wheter we need to unref or not. When we suggest a new format 
+   * whether we need to unref or not. When we suggest a new format 
    * upstream we will create a new caps that we need to unref. */
   alloc_caps = caps;
   alloc_unref = FALSE;
@@ -1951,8 +1965,10 @@ beach:
 static gboolean
 gst_ximagesink_interface_supported (GstImplementsInterface * iface, GType type)
 {
-  g_assert (type == GST_TYPE_NAVIGATION || type == GST_TYPE_X_OVERLAY);
-  return TRUE;
+  if (type == GST_TYPE_NAVIGATION || type == GST_TYPE_X_OVERLAY)
+    return TRUE;
+  else
+    return FALSE;
 }
 
 static void
@@ -2366,8 +2382,8 @@ gst_ximagesink_base_init (gpointer g_class)
       "Video sink", "Sink/Video",
       "A standard X based videosink", "Julien Moutte <julien@moutte.net>");
 
-  gst_element_class_add_pad_template (element_class,
-      gst_static_pad_template_get (&gst_ximagesink_sink_template_factory));
+  gst_element_class_add_static_pad_template (element_class,
+      &gst_ximagesink_sink_template_factory);
 }
 
 static void
@@ -2393,8 +2409,9 @@ gst_ximagesink_class_init (GstXImageSinkClass * klass)
       g_param_spec_string ("display", "Display", "X Display name",
           NULL, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (gobject_class, PROP_SYNCHRONOUS,
-      g_param_spec_boolean ("synchronous", "Synchronous", "When enabled, runs "
-          "the X display in synchronous mode. (used only for debugging)", FALSE,
+      g_param_spec_boolean ("synchronous", "Synchronous",
+          "When enabled, runs the X display in synchronous mode. "
+          "(unrelated to A/V sync, used only for debugging)", FALSE,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (gobject_class, PROP_FORCE_ASPECT_RATIO,
       g_param_spec_boolean ("force-aspect-ratio", "Force aspect ratio",

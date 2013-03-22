@@ -147,8 +147,9 @@ gst_cd_paranoia_src_class_init (GstCdParanoiaSrcClass * klass)
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (G_OBJECT_CLASS (klass), PROP_READ_SPEED,
       g_param_spec_int ("read-speed", "Read speed",
-          "Read from device at specified speed", -1, G_MAXINT,
-          DEFAULT_READ_SPEED, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+          "Read from device at specified speed (-1 and 0 = full speed)",
+          -1, G_MAXINT, DEFAULT_READ_SPEED,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (G_OBJECT_CLASS (klass), PROP_PARANOIA_MODE,
       g_param_spec_flags ("paranoia-mode", "Paranoia mode",
           "Type of checking to perform", GST_TYPE_CD_PARANOIA_MODE,
@@ -232,9 +233,8 @@ gst_cd_paranoia_src_open (GstCddaBaseSrc * cddabasesrc, const gchar * device)
   if (cdda_open (src->d))
     goto open_failed;
 
-  if (src->read_speed != -1) {
-    cdda_speed_set (src->d, src->read_speed);
-  }
+  GST_INFO_OBJECT (src, "set read speed to %d", src->read_speed);
+  cdda_speed_set (src->d, src->read_speed);
 
   for (i = 1; i < src->d->tracks + 1; i++) {
     GstCddaBaseSrcTrack track = { 0, };
@@ -529,13 +529,12 @@ plugin_init (GstPlugin * plugin)
   bind_textdomain_codeset (GETTEXT_PACKAGE, "UTF-8");
 #endif
 
-
   return TRUE;
 }
-
 
 GST_PLUGIN_DEFINE (GST_VERSION_MAJOR,
     GST_VERSION_MINOR,
     "cdparanoia",
     "Read audio from CD in paranoid mode",
-    plugin_init, VERSION, "LGPL", GST_PACKAGE_NAME, GST_PACKAGE_ORIGIN)
+    plugin_init, GST_PLUGINS_BASE_VERSION, "LGPL", GST_PACKAGE_NAME,
+    GST_PACKAGE_ORIGIN)

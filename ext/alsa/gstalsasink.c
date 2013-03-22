@@ -51,7 +51,9 @@
 #include "gstalsasink.h"
 #include "gstalsadeviceprobe.h"
 
+#include <gst/audio/gstaudioiec61937.h>
 #include <gst/gst-i18n-plugin.h>
+#include "gst/glib-compat-private.h"
 
 #define DEFAULT_DEVICE		"default"
 #define DEFAULT_DEVICE_NAME	""
@@ -90,6 +92,9 @@ static guint gst_alsasink_write (GstAudioSink * asink, gpointer data,
     guint length);
 static guint gst_alsasink_delay (GstAudioSink * asink);
 static void gst_alsasink_reset (GstAudioSink * asink);
+static gboolean gst_alsasink_acceptcaps (GstPad * pad, GstCaps * caps);
+static GstBuffer *gst_alsasink_payload (GstBaseAudioSink * sink,
+    GstBuffer * buf);
 
 static gint output_ref;         /* 0    */
 static snd_output_t *output;    /* NULL */
@@ -135,7 +140,7 @@ static GstStaticPadTemplate alsasink_sink_factory =
         "width = (int) 8, "
         "depth = (int) 8, "
         "rate = (int) [ 1, MAX ], " "channels = (int) [ 1, MAX ];"
-        "audio/x-iec958")
+        PASSTHROUGH_CAPS)
     );
 
 static void
@@ -145,6 +150,7 @@ gst_alsasink_finalise (GObject * object)
 
   g_free (sink->device);
   g_mutex_free (sink->alsa_lock);
+  g_mutex_free (sink->delay_lock);
 
   g_static_mutex_lock (&output_mutex);
   --output_ref;
@@ -172,8 +178,8 @@ gst_alsasink_base_init (gpointer g_class)
       "Audio sink (ALSA)", "Sink/Audio",
       "Output to a sound card via ALSA", "Wim Taymans <wim@fluendo.com>");
 
-  gst_element_class_add_pad_template (element_class,
-      gst_static_pad_template_get (&alsasink_sink_factory));
+  gst_element_class_add_static_pad_template (element_class,
+      &alsasink_sink_factory);
 }
 
 static void
@@ -181,10 +187,12 @@ gst_alsasink_class_init (GstAlsaSinkClass * klass)
 {
   GObjectClass *gobject_class;
   GstBaseSinkClass *gstbasesink_class;
+  GstBaseAudioSinkClass *gstbaseaudiosink_class;
   GstAudioSinkClass *gstaudiosink_class;
 
   gobject_class = (GObjectClass *) klass;
   gstbasesink_class = (GstBaseSinkClass *) klass;
+  gstbaseaudiosink_class = (GstBaseAudioSinkClass *) klass;
   gstaudiosink_class = (GstAudioSinkClass *) klass;
 
   parent_class = g_type_class_peek_parent (klass);
@@ -194,6 +202,8 @@ gst_alsasink_class_init (GstAlsaSinkClass * klass)
   gobject_class->set_property = gst_alsasink_set_property;
 
   gstbasesink_class->get_caps = GST_DEBUG_FUNCPTR (gst_alsasink_getcaps);
+
+  gstbaseaudiosink_class->payload = GST_DEBUG_FUNCPTR (gst_alsasink_payload);
 
   gstaudiosink_class->open = GST_DEBUG_FUNCPTR (gst_alsasink_open);
   gstaudiosink_class->prepare = GST_DEBUG_FUNCPTR (gst_alsasink_prepare);
@@ -279,6 +289,7 @@ gst_alsasink_init (GstAlsaSink * alsasink, GstAlsaSinkClass * g_class)
   alsasink->handle = NULL;
   alsasink->cached_caps = NULL;
   alsasink->alsa_lock = g_mutex_new ();
+  alsasink->delay_lock = g_mutex_new ();
 
   g_static_mutex_lock (&output_mutex);
   if (output_ref == 0) {
@@ -286,12 +297,18 @@ gst_alsasink_init (GstAlsaSink * alsasink, GstAlsaSinkClass * g_class)
     ++output_ref;
   }
   g_static_mutex_unlock (&output_mutex);
+
+  gst_pad_set_acceptcaps_function (GST_BASE_SINK (alsasink)->sinkpad,
+      GST_DEBUG_FUNCPTR (gst_alsasink_acceptcaps));
+
 }
 
 #define CHECK(call, error) \
-G_STMT_START {                  \
-if ((err = call) < 0)           \
-  goto error;                   \
+G_STMT_START {             \
+  if ((err = call) < 0) {  \
+    GST_WARNING_OBJECT (alsa, "Error %d (%s) calling " #call, err, snd_strerror (err)); \
+    goto error;            \
+  }                        \
 } G_STMT_END;
 
 static GstCaps *
@@ -316,8 +333,8 @@ gst_alsasink_getcaps (GstBaseSink * bsink)
   pad_template = gst_element_class_get_pad_template (element_class, "sink");
   g_return_val_if_fail (pad_template != NULL, NULL);
 
-  caps = gst_alsa_probe_supported_formats (GST_OBJECT (sink), sink->handle,
-      gst_pad_template_get_caps (pad_template));
+  caps = gst_alsa_probe_supported_formats (GST_OBJECT (sink), sink->device,
+      sink->handle, gst_pad_template_get_caps (pad_template));
 
   if (caps) {
     sink->cached_caps = gst_caps_ref (caps);
@@ -326,6 +343,60 @@ gst_alsasink_getcaps (GstBaseSink * bsink)
   GST_INFO_OBJECT (sink, "returning caps %" GST_PTR_FORMAT, caps);
 
   return caps;
+}
+
+static gboolean
+gst_alsasink_acceptcaps (GstPad * pad, GstCaps * caps)
+{
+  GstAlsaSink *alsa = GST_ALSA_SINK (gst_pad_get_parent_element (pad));
+  GstCaps *pad_caps;
+  GstStructure *st;
+  gboolean ret = FALSE;
+  GstRingBufferSpec spec = { 0 };
+
+  pad_caps = gst_pad_get_caps_reffed (pad);
+  if (pad_caps) {
+    ret = gst_caps_can_intersect (pad_caps, caps);
+    gst_caps_unref (pad_caps);
+    if (!ret)
+      goto done;
+  }
+
+  /* If we've not got fixed caps, creating a stream might fail, so let's just
+   * return from here with default acceptcaps behaviour */
+  if (!gst_caps_is_fixed (caps))
+    goto done;
+
+  /* parse helper expects this set, so avoid nasty warning
+   * will be set properly later on anyway  */
+  spec.latency_time = GST_SECOND;
+  if (!gst_ring_buffer_parse_caps (&spec, caps))
+    goto done;
+
+  /* Make sure input is framed (one frame per buffer) and can be payloaded */
+  switch (spec.type) {
+    case GST_BUFTYPE_AC3:
+    case GST_BUFTYPE_EAC3:
+    case GST_BUFTYPE_DTS:
+    case GST_BUFTYPE_MPEG:
+    {
+      gboolean framed = FALSE, parsed = FALSE;
+      st = gst_caps_get_structure (caps, 0);
+
+      gst_structure_get_boolean (st, "framed", &framed);
+      gst_structure_get_boolean (st, "parsed", &parsed);
+      if ((!framed && !parsed) || gst_audio_iec61937_frame_size (&spec) <= 0)
+        goto done;
+    }
+    default:{
+    }
+  }
+  ret = TRUE;
+
+done:
+  gst_caps_replace (&spec.caps, NULL);
+  gst_object_unref (alsa);
+  return ret;
 }
 
 static int
@@ -373,8 +444,6 @@ retry:
   rrate = alsa->rate;
   CHECK (snd_pcm_hw_params_set_rate_near (alsa->handle, params, &rrate, NULL),
       no_rate);
-  if (rrate != alsa->rate)
-    goto rate_match;
 
 #ifndef GST_DISABLE_GST_DEBUG
   /* get and dump some limits */
@@ -503,13 +572,6 @@ no_rate:
         ("Rate %iHz not available for playback: %s",
             alsa->rate, snd_strerror (err)));
     return err;
-  }
-rate_match:
-  {
-    GST_ELEMENT_ERROR (alsa, RESOURCE, SETTINGS, (NULL),
-        ("Rate doesn't match (requested %iHz, get %iHz)", alsa->rate, err));
-    snd_pcm_hw_params_free (params);
-    return -EINVAL;
   }
 buffer_size:
   {
@@ -648,7 +710,10 @@ alsasink_parse_spec (GstAlsaSink * alsa, GstRingBufferSpec * spec)
     case GST_BUFTYPE_MU_LAW:
       alsa->format = SND_PCM_FORMAT_MU_LAW;
       break;
-    case GST_BUFTYPE_IEC958:
+    case GST_BUFTYPE_AC3:
+    case GST_BUFTYPE_EAC3:
+    case GST_BUFTYPE_DTS:
+    case GST_BUFTYPE_MPEG:
       alsa->format = SND_PCM_FORMAT_S16_BE;
       alsa->iec958 = TRUE;
       break;
@@ -713,9 +778,9 @@ gst_alsasink_prepare (GstAudioSink * asink, GstRingBufferSpec * spec)
 
   alsa = GST_ALSA_SINK (asink);
 
-  if (spec->format == GST_IEC958) {
+  if (alsa->iec958) {
     snd_pcm_close (alsa->handle);
-    alsa->handle = gst_alsa_open_iec958_pcm (GST_OBJECT (alsa));
+    alsa->handle = gst_alsa_open_iec958_pcm (GST_OBJECT (alsa), alsa->device);
     if (G_UNLIKELY (!alsa->handle)) {
       goto no_iec958;
     }
@@ -866,7 +931,9 @@ gst_alsasink_write (GstAudioSink * asink, gpointer data, guint length)
     if (err < 0) {
       GST_DEBUG_OBJECT (asink, "wait error, %d", err);
     } else {
+      GST_DELAY_SINK_LOCK (asink);
       err = snd_pcm_writei (alsa->handle, ptr, cptr);
+      GST_DELAY_SINK_UNLOCK (asink);
     }
 
     GST_DEBUG_OBJECT (asink, "written %d frames out of %d", err, cptr);
@@ -903,7 +970,9 @@ gst_alsasink_delay (GstAudioSink * asink)
 
   alsa = GST_ALSA_SINK (asink);
 
+  GST_DELAY_SINK_LOCK (asink);
   res = snd_pcm_delay (alsa->handle, &delay);
+  GST_DELAY_SINK_UNLOCK (asink);
   if (G_UNLIKELY (res < 0)) {
     /* on errors, report 0 delay */
     GST_DEBUG_OBJECT (alsa, "snd_pcm_delay returned %d", res);
@@ -951,4 +1020,35 @@ prepare_error:
     GST_ALSA_SINK_UNLOCK (asink);
     return;
   }
+}
+
+static GstBuffer *
+gst_alsasink_payload (GstBaseAudioSink * sink, GstBuffer * buf)
+{
+  GstAlsaSink *alsa;
+
+  alsa = GST_ALSA_SINK (sink);
+
+  if (alsa->iec958) {
+    GstBuffer *out;
+    gint framesize;
+
+    framesize = gst_audio_iec61937_frame_size (&sink->ringbuffer->spec);
+    if (framesize <= 0)
+      return NULL;
+
+    out = gst_buffer_new_and_alloc (framesize);
+
+    if (!gst_audio_iec61937_payload (GST_BUFFER_DATA (buf),
+            GST_BUFFER_SIZE (buf), GST_BUFFER_DATA (out),
+            GST_BUFFER_SIZE (out), &sink->ringbuffer->spec)) {
+      gst_buffer_unref (out);
+      return NULL;
+    }
+
+    gst_buffer_copy_metadata (out, buf, GST_BUFFER_COPY_ALL);
+    return out;
+  }
+
+  return gst_buffer_ref (buf);
 }

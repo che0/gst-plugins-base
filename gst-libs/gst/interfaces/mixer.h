@@ -47,6 +47,13 @@ G_BEGIN_DECLS
 typedef struct _GstMixer GstMixer;
 typedef struct _GstMixerClass GstMixerClass;
 
+/**
+ * GstMixerType:
+ * @GST_MIXER_HARDWARE: mixing is implemented with dedicated hardware.
+ * @GST_MIXER_SOFTWARE: mixing is implemented via software processing.
+ *
+ * Mixer classification.
+ */
 typedef enum
 {
   GST_MIXER_HARDWARE,
@@ -110,7 +117,10 @@ typedef enum
 struct _GstMixerClass {
   GTypeInterface klass;
 
+/* FIXME 0.11: Remove this */
+#ifndef GST_REMOVE_DEPRECATED
   GstMixerType mixer_type;
+#endif
 
   /* virtual functions */
   const GList *  (* list_tracks)   (GstMixer      *mixer);
@@ -159,8 +169,10 @@ struct _GstMixerClass {
 
   GstMixerFlags (* get_mixer_flags) (GstMixer *mixer);
 
+  GstMixerType  (* get_mixer_type)  (GstMixer *mixer);
+
   /*< private >*/
-  gpointer _gst_reserved[GST_PADDING-1];
+  gpointer _gst_reserved[GST_PADDING-2];
 };
 
 GType           gst_mixer_get_type      (void);

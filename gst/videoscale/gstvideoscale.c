@@ -1,6 +1,6 @@
 /* GStreamer
  * Copyright (C) <1999> Erik Walthinsen <omega@cse.ogi.edu>
- * Copyright (C) 2005 David Schleef <ds@schleef.org>
+ * Copyright (C) 2005-2012 David Schleef <ds@schleef.org>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Library General Public
@@ -89,13 +89,22 @@ GST_DEBUG_CATEGORY (video_scale_debug);
 
 #define DEFAULT_PROP_METHOD       GST_VIDEO_SCALE_BILINEAR
 #define DEFAULT_PROP_ADD_BORDERS  FALSE
+#define DEFAULT_PROP_SHARPNESS    1.0
+#define DEFAULT_PROP_SHARPEN      0.0
+#define DEFAULT_PROP_DITHER       FALSE
+#define DEFAULT_PROP_SUBMETHOD    1
+#define DEFAULT_PROP_ENVELOPE     2.0
 
 enum
 {
   PROP_0,
   PROP_METHOD,
-  PROP_ADD_BORDERS
-      /* FILL ME */
+  PROP_ADD_BORDERS,
+  PROP_SHARPNESS,
+  PROP_SHARPEN,
+  PROP_DITHER,
+  PROP_SUBMETHOD,
+  PROP_ENVELOPE
 };
 
 #undef GST_VIDEO_SIZE_RANGE
@@ -131,7 +140,8 @@ static GstStaticCaps gst_video_scale_format_caps[] = {
   GST_STATIC_CAPS (GST_VIDEO_CAPS_YUV ("Y8  ")),
   GST_STATIC_CAPS (GST_VIDEO_CAPS_YUV ("GREY")),
   GST_STATIC_CAPS (GST_VIDEO_CAPS_YUV ("AY64")),
-  GST_STATIC_CAPS (GST_VIDEO_CAPS_ARGB_64)
+  GST_STATIC_CAPS (GST_VIDEO_CAPS_ARGB_64),
+  GST_STATIC_CAPS (GST_VIDEO_CAPS_YUV ("NV12"))
 };
 
 #define GST_TYPE_VIDEO_SCALE_METHOD (gst_video_scale_method_get_type())
@@ -144,6 +154,7 @@ gst_video_scale_method_get_type (void)
     {GST_VIDEO_SCALE_NEAREST, "Nearest Neighbour", "nearest-neighbour"},
     {GST_VIDEO_SCALE_BILINEAR, "Bilinear", "bilinear"},
     {GST_VIDEO_SCALE_4TAP, "4-tap", "4-tap"},
+    {GST_VIDEO_SCALE_LANCZOS, "Lanczos", "lanczos"},
     {0, NULL, NULL},
   };
 
@@ -219,15 +230,18 @@ static void
 gst_video_scale_base_init (gpointer g_class)
 {
   GstElementClass *element_class = GST_ELEMENT_CLASS (g_class);
+  GstPadTemplate *pad_template;
 
   gst_element_class_set_details_simple (element_class,
       "Video scaler", "Filter/Converter/Video/Scaler",
       "Resizes video", "Wim Taymans <wim.taymans@chello.be>");
 
-  gst_element_class_add_pad_template (element_class,
-      gst_video_scale_sink_template_factory ());
-  gst_element_class_add_pad_template (element_class,
-      gst_video_scale_src_template_factory ());
+  pad_template = gst_video_scale_sink_template_factory ();
+  gst_element_class_add_pad_template (element_class, pad_template);
+  gst_object_unref (pad_template);
+  pad_template = gst_video_scale_src_template_factory ();
+  gst_element_class_add_pad_template (element_class, pad_template);
+  gst_object_unref (pad_template);
 }
 
 static void
@@ -251,6 +265,36 @@ gst_video_scale_class_init (GstVideoScaleClass * klass)
           DEFAULT_PROP_ADD_BORDERS,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  g_object_class_install_property (gobject_class, PROP_SHARPNESS,
+      g_param_spec_double ("sharpness", "Sharpness",
+          "Sharpness of filter", 0.0, 2.0, DEFAULT_PROP_SHARPNESS,
+          G_PARAM_CONSTRUCT | G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_SHARPEN,
+      g_param_spec_double ("sharpen", "Sharpen",
+          "Sharpening", 0.0, 1.0, DEFAULT_PROP_SHARPEN,
+          G_PARAM_CONSTRUCT | G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_DITHER,
+      g_param_spec_boolean ("dither", "Dither",
+          "Add dither (only used for Lanczos method)",
+          DEFAULT_PROP_DITHER,
+          G_PARAM_CONSTRUCT | G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+#if 0
+  /* I am hiding submethod for now, since it's poorly named, poorly
+   * documented, and will probably just get people into trouble. */
+  g_object_class_install_property (gobject_class, PROP_SUBMETHOD,
+      g_param_spec_int ("submethod", "submethod",
+          "submethod", 0, 3, DEFAULT_PROP_SUBMETHOD,
+          G_PARAM_CONSTRUCT | G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+#endif
+
+  g_object_class_install_property (gobject_class, PROP_ENVELOPE,
+      g_param_spec_double ("envelope", "Envelope",
+          "Size of filter envelope", 0.0, 5.0, DEFAULT_PROP_ENVELOPE,
+          G_PARAM_CONSTRUCT | G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
   trans_class->transform_caps =
       GST_DEBUG_FUNCPTR (gst_video_scale_transform_caps);
   trans_class->set_caps = GST_DEBUG_FUNCPTR (gst_video_scale_set_caps);
@@ -267,6 +311,11 @@ gst_video_scale_init (GstVideoScale * videoscale, GstVideoScaleClass * klass)
   videoscale->tmp_buf = NULL;
   videoscale->method = DEFAULT_PROP_METHOD;
   videoscale->add_borders = DEFAULT_PROP_ADD_BORDERS;
+  videoscale->submethod = DEFAULT_PROP_SUBMETHOD;
+  videoscale->sharpness = DEFAULT_PROP_SHARPNESS;
+  videoscale->sharpen = DEFAULT_PROP_SHARPEN;
+  videoscale->dither = DEFAULT_PROP_DITHER;
+  videoscale->envelope = DEFAULT_PROP_ENVELOPE;
 }
 
 static void
@@ -296,6 +345,31 @@ gst_video_scale_set_property (GObject * object, guint prop_id,
       GST_OBJECT_UNLOCK (vscale);
       gst_base_transform_reconfigure (GST_BASE_TRANSFORM_CAST (vscale));
       break;
+    case PROP_SHARPNESS:
+      GST_OBJECT_LOCK (vscale);
+      vscale->sharpness = g_value_get_double (value);
+      GST_OBJECT_UNLOCK (vscale);
+      break;
+    case PROP_SHARPEN:
+      GST_OBJECT_LOCK (vscale);
+      vscale->sharpen = g_value_get_double (value);
+      GST_OBJECT_UNLOCK (vscale);
+      break;
+    case PROP_DITHER:
+      GST_OBJECT_LOCK (vscale);
+      vscale->dither = g_value_get_boolean (value);
+      GST_OBJECT_UNLOCK (vscale);
+      break;
+    case PROP_SUBMETHOD:
+      GST_OBJECT_LOCK (vscale);
+      vscale->submethod = g_value_get_int (value);
+      GST_OBJECT_UNLOCK (vscale);
+      break;
+    case PROP_ENVELOPE:
+      GST_OBJECT_LOCK (vscale);
+      vscale->envelope = g_value_get_double (value);
+      GST_OBJECT_UNLOCK (vscale);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -319,16 +393,149 @@ gst_video_scale_get_property (GObject * object, guint prop_id, GValue * value,
       g_value_set_boolean (value, vscale->add_borders);
       GST_OBJECT_UNLOCK (vscale);
       break;
+    case PROP_SHARPNESS:
+      GST_OBJECT_LOCK (vscale);
+      g_value_set_double (value, vscale->sharpness);
+      GST_OBJECT_UNLOCK (vscale);
+      break;
+    case PROP_SHARPEN:
+      GST_OBJECT_LOCK (vscale);
+      g_value_set_double (value, vscale->sharpen);
+      GST_OBJECT_UNLOCK (vscale);
+      break;
+    case PROP_DITHER:
+      GST_OBJECT_LOCK (vscale);
+      g_value_set_boolean (value, vscale->dither);
+      GST_OBJECT_UNLOCK (vscale);
+      break;
+    case PROP_SUBMETHOD:
+      GST_OBJECT_LOCK (vscale);
+      g_value_set_int (value, vscale->submethod);
+      GST_OBJECT_UNLOCK (vscale);
+      break;
+    case PROP_ENVELOPE:
+      GST_OBJECT_LOCK (vscale);
+      g_value_set_double (value, vscale->envelope);
+      GST_OBJECT_UNLOCK (vscale);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
   }
 }
 
+#define NEAREST  (1 << GST_VIDEO_SCALE_NEAREST)
+#define BILINEAR (1 << GST_VIDEO_SCALE_BILINEAR)
+#define FOURTAP  (1 << GST_VIDEO_SCALE_4TAP)
+#define LANCZOS  (1 << GST_VIDEO_SCALE_LANCZOS)
+
+/* or we could just do lookups via table[format] if we could be bothered..  */
+static const struct
+{
+  GstVideoFormat format;
+  guint8 methods;
+} formats_methods_table[] = {
+  {
+  GST_VIDEO_FORMAT_RGBx, NEAREST | BILINEAR | FOURTAP | LANCZOS}, {
+  GST_VIDEO_FORMAT_xRGB, NEAREST | BILINEAR | FOURTAP | LANCZOS}, {
+  GST_VIDEO_FORMAT_BGRx, NEAREST | BILINEAR | FOURTAP | LANCZOS}, {
+  GST_VIDEO_FORMAT_xBGR, NEAREST | BILINEAR | FOURTAP | LANCZOS}, {
+  GST_VIDEO_FORMAT_RGBA, NEAREST | BILINEAR | FOURTAP | LANCZOS}, {
+  GST_VIDEO_FORMAT_ARGB, NEAREST | BILINEAR | FOURTAP | LANCZOS}, {
+  GST_VIDEO_FORMAT_BGRA, NEAREST | BILINEAR | FOURTAP | LANCZOS}, {
+  GST_VIDEO_FORMAT_ABGR, NEAREST | BILINEAR | FOURTAP | LANCZOS}, {
+  GST_VIDEO_FORMAT_AYUV, NEAREST | BILINEAR | FOURTAP | LANCZOS}, {
+  GST_VIDEO_FORMAT_ARGB64, NEAREST | BILINEAR | FOURTAP | LANCZOS}, {
+  GST_VIDEO_FORMAT_AYUV64, NEAREST | BILINEAR | FOURTAP | LANCZOS}, {
+  GST_VIDEO_FORMAT_RGB, NEAREST | BILINEAR | FOURTAP}, {
+  GST_VIDEO_FORMAT_BGR, NEAREST | BILINEAR | FOURTAP}, {
+  GST_VIDEO_FORMAT_v308, NEAREST | BILINEAR | FOURTAP}, {
+  GST_VIDEO_FORMAT_YUY2, NEAREST | BILINEAR | FOURTAP}, {
+  GST_VIDEO_FORMAT_YVYU, NEAREST | BILINEAR | FOURTAP}, {
+  GST_VIDEO_FORMAT_UYVY, NEAREST | BILINEAR | FOURTAP}, {
+  GST_VIDEO_FORMAT_Y800, NEAREST | BILINEAR | FOURTAP}, {
+  GST_VIDEO_FORMAT_GRAY8, NEAREST | BILINEAR | FOURTAP}, {
+  GST_VIDEO_FORMAT_GRAY16_LE, NEAREST | BILINEAR | FOURTAP}, {
+  GST_VIDEO_FORMAT_GRAY16_BE, NEAREST | BILINEAR | FOURTAP}, {
+  GST_VIDEO_FORMAT_Y16, NEAREST | BILINEAR | FOURTAP}, {
+  GST_VIDEO_FORMAT_I420, NEAREST | BILINEAR | FOURTAP | LANCZOS}, {
+  GST_VIDEO_FORMAT_YV12, NEAREST | BILINEAR | FOURTAP | LANCZOS}, {
+  GST_VIDEO_FORMAT_Y444, NEAREST | BILINEAR | FOURTAP | LANCZOS}, {
+  GST_VIDEO_FORMAT_Y42B, NEAREST | BILINEAR | FOURTAP | LANCZOS}, {
+  GST_VIDEO_FORMAT_Y41B, NEAREST | BILINEAR | FOURTAP | LANCZOS}, {
+  GST_VIDEO_FORMAT_NV12, NEAREST | BILINEAR}, {
+  GST_VIDEO_FORMAT_RGB16, NEAREST | BILINEAR | FOURTAP}, {
+  GST_VIDEO_FORMAT_RGB15, NEAREST | BILINEAR | FOURTAP}
+};
+
+static gboolean
+gst_video_scale_format_supported_for_method (GstVideoFormat format,
+    GstVideoScaleMethod method)
+{
+  int i;
+
+  for (i = 0; i < G_N_ELEMENTS (formats_methods_table); ++i) {
+    if (formats_methods_table[i].format == format)
+      return ((formats_methods_table[i].methods & (1 << method)) != 0);
+  }
+  return FALSE;
+}
+
+static gboolean
+gst_video_scale_transform_supported (GstVideoScale * videoscale,
+    GstVideoScaleMethod method, GstStructure * structure)
+{
+  const GValue *val;
+  GstVideoFormat fmt;
+  gboolean supported = TRUE;
+  GstStructure *s;
+  GstCaps *c;
+
+  /* we support these methods for all formats */
+  if (method == GST_VIDEO_SCALE_NEAREST || method == GST_VIDEO_SCALE_BILINEAR)
+    return TRUE;
+
+  /* we need fixed caps if we want to use gst_video_parse_caps() */
+  s = gst_structure_new (gst_structure_get_name (structure),
+      "width", G_TYPE_INT, 1, "height", G_TYPE_INT, 1, NULL);
+
+  if ((val = gst_structure_get_value (structure, "format"))) {
+    gst_structure_set_value (s, "format", val);
+  } else {
+    if ((val = gst_structure_get_value (structure, "endianness")))
+      gst_structure_set_value (s, "endianness", val);
+    if ((val = gst_structure_get_value (structure, "red_mask")))
+      gst_structure_set_value (s, "red_mask", val);
+    if ((val = gst_structure_get_value (structure, "blue_mask")))
+      gst_structure_set_value (s, "blue_mask", val);
+    if ((val = gst_structure_get_value (structure, "green_mask")))
+      gst_structure_set_value (s, "green_mask", val);
+    if ((val = gst_structure_get_value (structure, "alpha_mask")))
+      gst_structure_set_value (s, "alpha_mask", val);
+    if ((val = gst_structure_get_value (structure, "depth")))
+      gst_structure_set_value (s, "depth", val);
+    if ((val = gst_structure_get_value (structure, "bpp")))
+      gst_structure_set_value (s, "bpp", val);
+  }
+  c = gst_caps_new_full (s, NULL);
+  if (!gst_video_format_parse_caps (c, &fmt, NULL, NULL)) {
+    GST_ERROR_OBJECT (videoscale, "couldn't parse %" GST_PTR_FORMAT, c);
+  } else if (!gst_video_scale_format_supported_for_method (fmt, method)) {
+    supported = FALSE;
+  }
+  GST_LOG_OBJECT (videoscale, "method %d %ssupported for format %d",
+      method, (supported) ? "" : "not ", fmt);
+  gst_caps_unref (c);
+
+  return supported;
+}
+
 static GstCaps *
 gst_video_scale_transform_caps (GstBaseTransform * trans,
     GstPadDirection direction, GstCaps * caps)
 {
+  GstVideoScale *videoscale = GST_VIDEO_SCALE (trans);
+  GstVideoScaleMethod method;
   GstCaps *ret;
   GstStructure *structure;
 
@@ -342,6 +549,13 @@ gst_video_scale_transform_caps (GstBaseTransform * trans,
   ret = gst_caps_copy (caps);
   structure = gst_structure_copy (gst_caps_get_structure (ret, 0));
 
+  GST_OBJECT_LOCK (videoscale);
+  method = videoscale->method;
+  GST_OBJECT_UNLOCK (videoscale);
+
+  if (!gst_video_scale_transform_supported (videoscale, method, structure))
+    goto format_not_supported;
+
   gst_structure_set (structure,
       "width", GST_TYPE_INT_RANGE, 1, G_MAXINT,
       "height", GST_TYPE_INT_RANGE, 1, G_MAXINT, NULL);
@@ -353,9 +567,19 @@ gst_video_scale_transform_caps (GstBaseTransform * trans,
   }
   gst_caps_append_structure (ret, structure);
 
+done:
+
   GST_DEBUG_OBJECT (trans, "returning caps: %" GST_PTR_FORMAT, ret);
 
   return ret;
+
+format_not_supported:
+  {
+    gst_structure_free (structure);
+    gst_caps_unref (ret);
+    ret = gst_caps_new_empty ();
+    goto done;
+  }
 }
 
 static gboolean
@@ -926,7 +1150,8 @@ gst_video_scale_setup_vs_image (VSImage * image, GstVideoFormat format,
   if (format == GST_VIDEO_FORMAT_I420
       || format == GST_VIDEO_FORMAT_YV12
       || format == GST_VIDEO_FORMAT_Y444
-      || format == GST_VIDEO_FORMAT_Y42B || format == GST_VIDEO_FORMAT_Y41B) {
+      || format == GST_VIDEO_FORMAT_Y42B || format == GST_VIDEO_FORMAT_Y41B
+      || format == GST_VIDEO_FORMAT_NV12) {
     image->real_pixels = data + gst_video_format_get_component_offset (format,
         component, width, height);
   } else {
@@ -992,6 +1217,7 @@ _get_black_for_format (GstVideoFormat format)
     case GST_VIDEO_FORMAT_Y444:
     case GST_VIDEO_FORMAT_Y42B:
     case GST_VIDEO_FORMAT_Y41B:
+    case GST_VIDEO_FORMAT_NV12:
       return black[4];          /* Y, U, V, 0 */
     case GST_VIDEO_FORMAT_RGB16:
     case GST_VIDEO_FORMAT_RGB15:
@@ -1055,6 +1281,14 @@ gst_video_scale_transform (GstBaseTransform * trans, GstBuffer * in,
         videoscale->to_width, videoscale->to_height, videoscale->borders_w,
         videoscale->borders_h, GST_BUFFER_DATA (out));
   }
+  if (videoscale->format == GST_VIDEO_FORMAT_NV12) {
+    gst_video_scale_setup_vs_image (&src_u, videoscale->format, 1,
+        videoscale->from_width, videoscale->from_height, 0, 0,
+        GST_BUFFER_DATA (in));
+    gst_video_scale_setup_vs_image (&dest_u, videoscale->format, 1,
+        videoscale->to_width, videoscale->to_height, videoscale->borders_w,
+        videoscale->borders_h, GST_BUFFER_DATA (out));
+  }
 
   switch (videoscale->format) {
     case GST_VIDEO_FORMAT_RGBx:
@@ -1078,6 +1312,11 @@ gst_video_scale_transform (GstBaseTransform * trans, GstBuffer * in,
         case GST_VIDEO_SCALE_4TAP:
           vs_image_scale_4tap_RGBA (&dest, &src, videoscale->tmp_buf);
           break;
+        case GST_VIDEO_SCALE_LANCZOS:
+          vs_image_scale_lanczos_AYUV (&dest, &src, videoscale->tmp_buf,
+              videoscale->sharpness, videoscale->dither, videoscale->submethod,
+              videoscale->envelope, videoscale->sharpen);
+          break;
         default:
           goto unknown_mode;
       }
@@ -1095,6 +1334,11 @@ gst_video_scale_transform (GstBaseTransform * trans, GstBuffer * in,
           break;
         case GST_VIDEO_SCALE_4TAP:
           vs_image_scale_4tap_AYUV64 (&dest, &src, videoscale->tmp_buf);
+          break;
+        case GST_VIDEO_SCALE_LANCZOS:
+          vs_image_scale_lanczos_AYUV64 (&dest, &src, videoscale->tmp_buf,
+              videoscale->sharpness, videoscale->dither, videoscale->submethod,
+              videoscale->envelope, videoscale->sharpen);
           break;
         default:
           goto unknown_mode;
@@ -1216,6 +1460,31 @@ gst_video_scale_transform (GstBaseTransform * trans, GstBuffer * in,
           vs_image_scale_4tap_Y (&dest, &src, videoscale->tmp_buf);
           vs_image_scale_4tap_Y (&dest_u, &src_u, videoscale->tmp_buf);
           vs_image_scale_4tap_Y (&dest_v, &src_v, videoscale->tmp_buf);
+          break;
+        case GST_VIDEO_SCALE_LANCZOS:
+          vs_image_scale_lanczos_Y (&dest, &src, videoscale->tmp_buf,
+              videoscale->sharpness, videoscale->dither, videoscale->submethod,
+              videoscale->envelope, videoscale->sharpen);
+          vs_image_scale_lanczos_Y (&dest_u, &src_u, videoscale->tmp_buf,
+              videoscale->sharpness, videoscale->dither, videoscale->submethod,
+              videoscale->envelope, videoscale->sharpen);
+          vs_image_scale_lanczos_Y (&dest_v, &src_v, videoscale->tmp_buf,
+              videoscale->sharpness, videoscale->dither, videoscale->submethod,
+              videoscale->envelope, videoscale->sharpen);
+          break;
+        default:
+          goto unknown_mode;
+      }
+      break;
+    case GST_VIDEO_FORMAT_NV12:
+      switch (method) {
+        case GST_VIDEO_SCALE_NEAREST:
+          vs_image_scale_nearest_Y (&dest, &src, videoscale->tmp_buf);
+          vs_image_scale_nearest_NV12 (&dest_u, &src_u, videoscale->tmp_buf);
+          break;
+        case GST_VIDEO_SCALE_BILINEAR:
+          vs_image_scale_linear_Y (&dest, &src, videoscale->tmp_buf);
+          vs_image_scale_linear_NV12 (&dest_u, &src_u, videoscale->tmp_buf);
           break;
         default:
           goto unknown_mode;

@@ -77,7 +77,6 @@
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#define EINPROGRESS WSAEINPROGRESS
 #else
 #include <sys/ioctl.h>
 #include <netdb.h>
@@ -92,6 +91,8 @@
 
 #include "gstrtspconnection.h"
 #include "gstrtspbase64.h"
+
+#include "gst/glib-compat-private.h"
 
 union gst_sockaddr
 {
@@ -456,7 +457,7 @@ wrong_family:
 static gchar *
 do_resolve (const gchar * host)
 {
-  static gchar ip[INET6_ADDRSTRLEN];
+  gchar ip[INET6_ADDRSTRLEN];
   struct addrinfo *aires, hints;
   struct addrinfo *ai;
   gint aierr;
@@ -592,6 +593,14 @@ do_connect (const gchar * ip, guint16 port, GstPollFD * fdout,
     getsockopt (fd, SOL_SOCKET, SO_ERROR, (char *) &errno, &len);
 #endif
     goto sys_error;
+  } else {
+#ifdef __APPLE__
+    /* osx wakes up select with POLLOUT if the connection is refused... */
+    socklen_t len = sizeof (errno);
+    getsockopt (fd, SOL_SOCKET, SO_ERROR, (char *) &errno, &len);
+    if (errno != 0)
+      goto sys_error;
+#endif
   }
 
   gst_poll_fd_ignored (fdset, fdout);
@@ -1899,7 +1908,7 @@ build_next (GstRTSPBuilder * builder, GstRTSPMessage * message,
           goto done;
 
         /* we have the complete body now, store in the message adjusting the
-         * length to include the traling '\0' */
+         * length to include the trailing '\0' */
         gst_rtsp_message_take_body (message,
             (guint8 *) builder->body_data, builder->body_len + 1);
         builder->body_data = NULL;
@@ -2269,7 +2278,9 @@ gst_rtsp_connection_receive (GstRTSPConnection * conn, GstRTSPMessage * message,
     if (gst_poll_fd_has_error (conn->fdset, conn->writefd))
       goto socket_error;
 
-    gst_poll_set_controllable (conn->fdset, FALSE);
+    /* once we start reading the wait cannot be controlled */
+    if (builder.state != STATE_START)
+      gst_poll_set_controllable (conn->fdset, FALSE);
   }
 
   /* we have a message here */
@@ -3051,12 +3062,15 @@ struct _GstRTSPWatch
   guint id;
   GMutex *mutex;
   GQueue *messages;
+  gsize messages_bytes;
   guint queued_bytes;
 
   guint8 *write_data;
   guint write_off;
   guint write_size;
   guint write_id;
+  gsize max_bytes;
+  guint max_messages;
 
   GstRTSPWatchFuncs funcs;
 
@@ -3204,6 +3218,7 @@ gst_rtsp_source_dispatch (GSource * source, GSourceFunc callback G_GNUC_UNUSED,
         if (rec == NULL)
           break;
 
+        watch->messages_bytes -= rec->size;
         watch->queued_bytes -= rec->size;
 
         watch->write_off = 0;
@@ -3310,6 +3325,7 @@ gst_rtsp_source_finalize (GSource * source)
   g_queue_foreach (watch->messages, (GFunc) gst_rtsp_rec_free, NULL);
   g_queue_free (watch->messages);
   watch->messages = NULL;
+  watch->messages_bytes = 0;
   g_free (watch->write_data);
 
   g_mutex_free (watch->mutex);
@@ -3448,9 +3464,63 @@ gst_rtsp_watch_unref (GstRTSPWatch * watch)
 }
 
 /**
+ * gst_rtsp_watch_set_send_backlog:
+ * @watch: a #GstRTSPWatch
+ * @bytes: maximum bytes
+ * @messages: maximum messages
+ *
+ * Set the maximum amount of bytes and messages that will be queued in @watch.
+ * When the maximum amounts are exceeded, gst_rtsp_watch_write_data() and
+ * gst_rtsp_watch_send_message() will return #GST_RTSP_ENOMEM.
+ *
+ * A value of 0 for @bytes or @messages means no limits.
+ *
+ * Since: 0.10.37
+ */
+void
+gst_rtsp_watch_set_send_backlog (GstRTSPWatch * watch,
+    gsize bytes, guint messages)
+{
+  g_return_if_fail (watch != NULL);
+
+  g_mutex_lock (watch->mutex);
+  watch->max_bytes = bytes;
+  watch->max_messages = messages;
+  g_mutex_unlock (watch->mutex);
+
+  GST_DEBUG ("set backlog to bytes %" G_GSIZE_FORMAT ", messages %u",
+      bytes, messages);
+}
+
+/**
+ * gst_rtsp_watch_get_send_backlog:
+ * @watch: a #GstRTSPWatch
+ * @bytes: (out) (allow-none): maximum bytes
+ * @messages: (out) (allow-none): maximum messages
+ *
+ * Get the maximum amount of bytes and messages that will be queued in @watch.
+ * See gst_rtsp_watch_set_send_backlog().
+ *
+ * Since: 0.10.37
+ */
+void
+gst_rtsp_watch_get_send_backlog (GstRTSPWatch * watch,
+    gsize * bytes, guint * messages)
+{
+  g_return_if_fail (watch != NULL);
+
+  g_mutex_lock (watch->mutex);
+  if (bytes)
+    *bytes = watch->max_bytes;
+  if (messages)
+    *messages = watch->max_messages;
+  g_mutex_unlock (watch->mutex);
+}
+
+/**
  * gst_rtsp_watch_write_data:
  * @watch: a #GstRTSPWatch
- * @data: the data to queue
+ * @data: (array length=size) (transfer full): the data to queue
  * @size: the size of @data
  * @id: location for a message ID or %NULL
  *
@@ -3463,7 +3533,12 @@ gst_rtsp_watch_unref (GstRTSPWatch * watch)
  *
  * This function will take ownership of @data and g_free() it after use.
  *
- * Returns: #GST_RTSP_OK on success.
+ * If the amount of queued data exceeds the limits set with
+ * gst_rtsp_watch_set_send_backlog(), this function will return
+ * #GST_RTSP_ENOMEM.
+ *
+ * Returns: #GST_RTSP_OK on success. #GST_RTSP_ENOMEM when the backlog limits
+ * are reached.
  *
  * Since: 0.10.25
  */
@@ -3485,7 +3560,7 @@ gst_rtsp_watch_write_data (GstRTSPWatch * watch, const guint8 * data,
   GST_TRACE_OBJECT (watch, "rtsp queue length: %u bytes", watch->queued_bytes);
 
   /* try to send the message synchronously first */
-  if (watch->messages->length == 0) {
+  if (watch->messages->length == 0 && watch->write_data == NULL) {
     res = write_bytes (watch->writefd.fd, data, &off, size);
     if (res != GST_RTSP_EINTR) {
       if (id != NULL)
@@ -3495,6 +3570,7 @@ gst_rtsp_watch_write_data (GstRTSPWatch * watch, const guint8 * data,
     }
   }
 
+  /* check limits -- patched */
   if (watch->queued_bytes > 1000000) {  // let's say 1 MB is the max queue length
     GST_LOG_OBJECT (watch, "RTSP queue is full, dropping message");
     res = GST_RTSP_OK;
@@ -3503,6 +3579,13 @@ gst_rtsp_watch_write_data (GstRTSPWatch * watch, const guint8 * data,
     g_free ((gpointer) data);
     goto done;
   }
+  
+  /* check limits -- upstream */
+  if ((watch->max_bytes != 0 && watch->messages_bytes >= watch->max_bytes) ||
+      (watch->max_messages != 0
+          && watch->messages->length >= watch->max_messages))
+    goto too_much_backlog;
+
 
   /* make a record with the data and id for sending async */
   rec = g_slice_new (GstRTSPRec);
@@ -3522,6 +3605,7 @@ gst_rtsp_watch_write_data (GstRTSPWatch * watch, const guint8 * data,
 
   /* add the record to a queue. */
   g_queue_push_head (watch->messages, rec);
+  watch->messages_bytes += rec->size;
   watch->queued_bytes += rec->size;
 
   /* make sure the main context will now also check for writability on the
@@ -3542,6 +3626,17 @@ done:
     g_main_context_wakeup (context);
 
   return res;
+
+  /* ERRORS */
+too_much_backlog:
+  {
+    GST_WARNING ("too much backlog: max_bytes %" G_GSIZE_FORMAT ", current %"
+        G_GSIZE_FORMAT ", max_messages %u, current %u", watch->max_bytes,
+        watch->messages_bytes, watch->max_messages, watch->messages->length);
+    g_mutex_unlock (watch->mutex);
+    g_free ((gpointer) data);
+    return GST_RTSP_ENOMEM;
+  }
 }
 
 /**

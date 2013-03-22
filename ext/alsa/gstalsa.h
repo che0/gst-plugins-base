@@ -38,12 +38,22 @@
      (SND_LIB_MAJOR == (major) && SND_LIB_MINOR == (minor) && \
       SND_LIB_SUBMINOR >= (micro)))
 
+#define PASSTHROUGH_CAPS \
+    "audio/x-ac3, framed = (boolean) true;" \
+    "audio/x-eac3, framed = (boolean) true; " \
+    "audio/x-dts, framed = (boolean) true, " \
+      "block-size = (int) { 512, 1024, 2048 }; " \
+    "audio/mpeg, mpegversion = (int) 1, " \
+      "mpegaudioversion = (int) [ 1, 2 ], parsed = (boolean) true;"
+
+
 GST_DEBUG_CATEGORY_EXTERN (alsa_debug);
 #define GST_CAT_DEFAULT alsa_debug
 
-snd_pcm_t * gst_alsa_open_iec958_pcm (GstObject * obj);
+snd_pcm_t * gst_alsa_open_iec958_pcm (GstObject * obj, gchar *device);
 
 GstCaps * gst_alsa_probe_supported_formats (GstObject      * obj,
+                                            gchar          * device,
                                             snd_pcm_t      * handle,
                                             const GstCaps  * template_caps);
 

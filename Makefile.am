@@ -56,6 +56,7 @@ endif
 
 WIN32_COPY = \
 	$(top_builddir)/gst-libs/gst/*/*-enumtypes.[ch] \
+	$(top_builddir)/gst-libs/gst/pbutils/gstpluginsbaseversion.h \
 	$(top_builddir)/_stdint.h
 
 win32-update:
@@ -76,6 +77,8 @@ check: check-exports
 CRUFT_FILES = \
 	$(top_builddir)/common/shave \
 	$(top_builddir)/common/shave-libtool \
+	$(top_builddir)/gst-libs/gst/audio/testchannels \
+	$(top_builddir)/tests/examples/volume/volume \
 	$(top_builddir)/tools/gst-discoverer
 
 

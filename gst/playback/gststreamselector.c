@@ -466,10 +466,10 @@ gst_stream_selector_base_init (GstStreamSelectorClass * klass)
       "Julien Moutte <julien@moutte.net>, "
       "Jan Schmidt <thaytan@mad.scientist.com>, "
       "Wim Taymans <wim.taymans@gmail.com>");
-  gst_element_class_add_pad_template (element_class,
-      gst_static_pad_template_get (&gst_stream_selector_sink_factory));
-  gst_element_class_add_pad_template (element_class,
-      gst_static_pad_template_get (&gst_stream_selector_src_factory));
+  gst_element_class_add_static_pad_template (element_class,
+      &gst_stream_selector_sink_factory);
+  gst_element_class_add_static_pad_template (element_class,
+      &gst_stream_selector_src_factory);
 }
 
 static void
@@ -496,6 +496,8 @@ gst_stream_selector_class_init (GstStreamSelectorClass * klass)
 
   gstelement_class->request_new_pad = gst_stream_selector_request_new_pad;
   gstelement_class->release_pad = gst_stream_selector_release_pad;
+
+  g_type_class_ref (GST_TYPE_SELECTOR_PAD);
 }
 
 static void

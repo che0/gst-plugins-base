@@ -41,11 +41,11 @@ G_BEGIN_DECLS
 
 /**
  * GstPlaySinkType:
- * @GST_PLAY_SINK_TYPE_AUDIO: A non-raw audio pad
- * @GST_PLAY_SINK_TYPE_AUDIO_RAW: a raw audio pad
- * @GST_PLAY_SINK_TYPE_VIDEO: a non-raw video pad
- * @GST_PLAY_SINK_TYPE_VIDEO_RAW: a raw video pad
- * @GST_PLAY_SINK_TYPE_TEXT: a raw text pad
+ * @GST_PLAY_SINK_TYPE_AUDIO: an audio pad
+ * @GST_PLAY_SINK_TYPE_AUDIO_RAW: a raw audio pad. Deprecated.
+ * @GST_PLAY_SINK_TYPE_VIDEO: a video pad
+ * @GST_PLAY_SINK_TYPE_VIDEO_RAW: a raw video pad. Deprecated.
+ * @GST_PLAY_SINK_TYPE_TEXT: a text pad
  * @GST_PLAY_SINK_TYPE_LAST: the last type
  * @GST_PLAY_SINK_TYPE_FLUSHING: a flushing pad, used when shutting down
  *
@@ -70,6 +70,7 @@ GType gst_play_sink_get_type (void);
 
 GstPad *         gst_play_sink_request_pad    (GstPlaySink *playsink, GstPlaySinkType type);
 void             gst_play_sink_release_pad    (GstPlaySink *playsink, GstPad *pad);
+void             gst_play_sink_refresh_pad    (GstPlaySink *playsink, GstPad *pad, GstPlaySinkType type);
 
 void             gst_play_sink_set_sink       (GstPlaySink * playsink, GstPlaySinkType type, GstElement * sink);
 GstElement *     gst_play_sink_get_sink       (GstPlaySink * playsink, GstPlaySinkType type);

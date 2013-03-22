@@ -43,8 +43,11 @@ Makefile
 *.gir
 *.typelib
 
-gst-libs/gst/pbutils/gstpluginsbaseversion.h
-gst-libs/gst/tag/mklangtables
+/gst-libs/gst/pbutils/gstpluginsbaseversion.h
+/gst-libs/gst/tag/mklangtables
+/gst-libs/gst/tag/mklicensestables
+
+/tests/examples/playback/playback-test
 
 tmp-orc.c
 gst*orc.h

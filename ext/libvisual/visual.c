@@ -26,6 +26,7 @@
 #include <gst/video/video.h>
 #include <gst/audio/audio.h>
 #include <libvisual/libvisual.h>
+#include <string.h>
 
 #define GST_TYPE_VISUAL (gst_visual_get_type())
 #define GST_IS_VISUAL(obj) (G_TYPE_CHECK_INSTANCE_TYPE((obj),GST_TYPE_VISUAL))
@@ -194,10 +195,8 @@ gst_visual_class_init (gpointer g_class, gpointer class_data)
         klass->plugin->info->name, klass->plugin->info->version);
 
     /* FIXME: improve to only register what plugin supports? */
-    gst_element_class_add_pad_template (element,
-        gst_static_pad_template_get (&src_template));
-    gst_element_class_add_pad_template (element,
-        gst_static_pad_template_get (&sink_template));
+    gst_element_class_add_static_pad_template (element, &src_template);
+    gst_element_class_add_static_pad_template (element, &sink_template);
     gst_element_class_set_details_simple (element,
         longname, "Visualization",
         klass->plugin->info->about, "Benjamin Otte <otte@gnome.org>");
@@ -550,7 +549,7 @@ gst_visual_src_query (GstPad * pad, GstQuery * query)
             GST_TIME_FORMAT " max %" GST_TIME_FORMAT,
             GST_TIME_ARGS (min_latency), GST_TIME_ARGS (max_latency));
 
-        /* the max samples we must buffer buffer */
+        /* the max samples we must buffer */
         max_samples = MAX (VISUAL_SAMPLES, visual->spf);
         our_latency =
             gst_util_uint64_scale_int (max_samples, GST_SECOND, visual->rate);

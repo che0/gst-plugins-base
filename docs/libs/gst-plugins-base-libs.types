@@ -3,6 +3,10 @@
 
 #include <gst/audio/gstaudioclock.h>
 gst_audio_clock_get_type
+#include <gst/audio/gstaudiodecoder.h>
+gst_audio_decoder_get_type
+#include <gst/audio/gstaudioencoder.h>
+gst_audio_encoder_get_type
 #include <gst/audio/gstaudiofilter.h>
 gst_audio_filter_get_type
 #include <gst/audio/gstaudiosink.h>
@@ -56,6 +60,16 @@ gst_base_rtp_audio_payload_get_type
 gst_video_filter_get_type
 #include <gst/video/gstvideosink.h>
 gst_video_sink_get_type
+#include <gst/video/video-overlay-composition.h>
+gst_video_overlay_rectangle_get_type
+gst_video_overlay_composition_get_type
+#include <gst/video/gstvideodecoder.h>
+gst_video_decoder_get_type
+#include <gst/video/gstvideoencoder.h>
+gst_video_encoder_get_type
+#include <gst/video/gstvideoutils.h>
+gst_video_codec_frame_get_type
+gst_video_codec_state_get_type
 
 #include <gst/pbutils/pbutils.h>
 gst_discoverer_get_type

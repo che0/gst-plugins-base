@@ -109,6 +109,7 @@ static const FormatInfo formats[] = {
   {"audio/x-dts", "DTS", 0},
   {"audio/x-private1-dts", "DTS", 0},
   {"audio/x-dv", "DV Audio", 0},
+  {"audio/x-eac3", "E-AC-3 (ATSC A/52B)", 0},
   {"audio/x-flac", N_("Free Lossless Audio Codec (FLAC)"), 0},
   {"audio/x-gsm", "GSM", 0},
   {"audio/x-iec958", "S/PDIF IEC958", 0},       /* TODO: check description */
@@ -152,7 +153,7 @@ static const FormatInfo formats[] = {
   {"video/sp5x", "Sunplus JPEG 5.x", 0},
   {"video/vivo", "Vivo", 0},
   {"video/x-3ivx", "3ivx", 0},
-  {"video/x-4xm", "4X Techologies Video", 0},
+  {"video/x-4xm", "4X Technologies Video", 0},
   {"video/x-apple-video", "Apple video", 0},
   {"video/x-aasc", "Autodesk Animator", 0},
   {"video/x-camtasia", "TechSmith Camtasia", 0},
@@ -231,15 +232,22 @@ static const FormatInfo formats[] = {
   {"image/x-quicktime", "QuickTime Image Format (QTIF)", 0},
   {"image/x-sun-raster", "Sun Raster Format (RAS)", 0},
   {"image/x-tga", "TGA", 0},
+  {"image/vnd.wap.wbmp", "Wireless Bitmap", 0},
 
   /* subtitle formats with static descriptions */
-  {"application/x-ass", "ASS", 0},
+  {"application/x-ssa", "SubStation Alpha", 0},
+  {"application/x-ass", "Advanced SubStation Alpha", 0},
+  /* FIXME: add variant field to typefinder? */
+  {"application/x-subtitle", N_("Subtitle"), 0},
+  {"application/x-subtitle-mpl2", N_("MPL2 subtitle format"), 0},
+  {"application/x-subtitle-dks", N_("DKS subtitle format"), 0},
+  {"application/x-subtitle-qttext", N_("QTtext subtitle format"), 0},
   {"application/x-subtitle-sami", N_("Sami subtitle format"), 0},
   {"application/x-subtitle-tmplayer", N_("TMPlayer subtitle format"), 0},
   {"application/x-kate", "Kate", 0},
   {"subtitle/x-kate", N_("Kate subtitle format"), 0},
   {"subpicture/x-dvb", "DVB subtitles", 0},
-  /* add variant field to typefinder? { "application/x-subtitle", N_("subtitle"), 0}, */
+  {"subpicture/x-pgs", "PGS subtitles", 0},
 
   /* non-audio/video/container formats */
   {"hdv/aux-v", "HDV AUX-V", 0},

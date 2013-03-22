@@ -1,13 +1,11 @@
-AC_PREREQ(2.60)
+AC_PREREQ([2.60])
 
 dnl please read gstreamer/docs/random/autotools before changing this file
 
 dnl initialize autoconf
 dnl releases only do -Wall, git and prerelease does -Werror too
 dnl use a three digit version number for releases, and four for git/prerelease
-AC_INIT(GStreamer Base Plug-ins, 0.10.35,
-    http://bugzilla.gnome.org/enter_bug.cgi?product=GStreamer,
-    gst-plugins-base)
+AC_INIT([GStreamer Base Plug-ins],[0.10.36.1],[http://bugzilla.gnome.org/enter_bug.cgi?product=GStreamer],[gst-plugins-base])
 
 AG_GST_INIT
 
@@ -24,7 +22,7 @@ dnl can autoconf find the source ?
 AC_CONFIG_SRCDIR([gst/audiotestsrc/gstaudiotestsrc.c])
 
 dnl define the output header for config
-AM_CONFIG_HEADER([config.h])
+AC_CONFIG_HEADERS([config.h])
 
 dnl AM_MAINTAINER_MODE only provides the option to configure to enable it
 AM_MAINTAINER_MODE
@@ -49,7 +47,7 @@ dnl - interfaces added/removed/changed -> increment CURRENT, REVISION = 0
 dnl - interfaces added -> increment AGE
 dnl - interfaces removed -> AGE = 0
 dnl sets GST_LT_LDFLAGS
-AS_LIBTOOL(GST, 24, 0, 24)
+AS_LIBTOOL(GST, 26, 0, 26)
 
 dnl FIXME: this macro doesn't actually work;
 dnl the generated libtool script has no support for the listed tags.
@@ -60,7 +58,7 @@ AC_LIBTOOL_WIN32_DLL
 AM_PROG_LIBTOOL
 
 dnl *** required versions of GStreamer stuff ***
-GST_REQ=0.10.34
+GST_REQ=0.10.36
 
 dnl *** autotools stuff ****
 
@@ -78,6 +76,8 @@ AG_GST_GETTEXT([gst-plugins-base-$GST_MAJORMINOR])
 
 dnl *** check for arguments to configure ***
 
+AG_GST_ARG_DISABLE_FATAL_WARNINGS
+
 AG_GST_ARG_DEBUG
 AG_GST_ARG_PROFILING
 AG_GST_ARG_VALGRIND
@@ -93,8 +93,7 @@ AG_GST_PKG_CONFIG_PATH
 
 dnl let distro override plugin install helper path
 AC_ARG_WITH(install-plugins-helper,
-  AC_HELP_STRING([--with-install-plugins-helper],
-    [specify path of helper script to call to install plugins]),
+  AS_HELP_STRING([--with-install-plugins-helper],[specify path of helper script to call to install plugins]),
   [
     case "${withval}" in
       yes) AC_MSG_ERROR(bad value ${withval} for --with-install-plugins-helper) ;;
@@ -119,6 +118,7 @@ AG_GST_ARG_ENABLE_EXTERNAL
 AG_GST_ARG_ENABLE_EXPERIMENTAL
 
 dnl *** checks for platform ***
+AG_GST_PLATFORM
 
 dnl * hardware/architecture *
 
@@ -144,7 +144,7 @@ AC_PROG_CXX
 dnl CXX may be set to some default even if no c++ compiler is available
 dnl (thanks autotools!), so just try to compile some c++ code to make sure
 AC_LANG_PUSH([C++])
-AC_TRY_COMPILE([ class Foo { int bar; };], , working_cxx=yes, working_cxx=no)
+AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[ class Foo { int bar; };]], [[]])],[working_cxx=yes],[working_cxx=no])
 AC_LANG_POP([C++])
 AC_MSG_NOTICE([working c++ compiler found: $working_cxx])
 AM_CONDITIONAL(HAVE_CXX, test "x$working_cxx" = "xyes")
@@ -173,24 +173,28 @@ AC_HEADER_STDC
 
 dnl used in gst/ffmpegcolorspace/mem.c
 dnl FIXME: could be fixed by redefining av_malloc and av_free to GLib's
-AC_CHECK_HEADERS([malloc.h])
+AC_CHECK_HEADERS([malloc.h], [], [], [AC_INCLUDES_DEFAULT])
 
 ac_cppflags_save="$CPPFLAGS"
 CPPFLAGS="`$PKG_CONFIG --cflags libxml-2.0`"
-AC_COMPILE_IFELSE(
-  AC_LANG_PROGRAM([
+AC_COMPILE_IFELSE([
+  AC_LANG_PROGRAM([[
 #include <libxml/HTMLparser.h>
-                     ],[
+]],[[
 #ifndef LIBXML_HTML_ENABLED
 #error libxml2 has no HTML support
 #endif /* LIBXML_HTML_ENABLED */
-                   ]), HAVE_LIBXML_HTML="yes", HAVE_LIBXML_HTML="no")
+]])], [
+  HAVE_LIBXML_HTML="yes"
+], [
+  HAVE_LIBXML_HTML="no"
+])
 CPPFLAGS="$ac_cppflags_save"
 AM_CONDITIONAL(HAVE_LIBXML_HTML, test "x$HAVE_LIBXML_HTML" = "xyes")
 
 dnl used in gst/tcp
-AC_CHECK_HEADERS([sys/socket.h], 
-  HAVE_SYS_SOCKET_H="yes", HAVE_SYS_SOCKET_H="no")
+AC_CHECK_HEADERS([sys/socket.h],
+  [HAVE_SYS_SOCKET_H="yes"], [HAVE_SYS_SOCKET_H="no"], [AC_INCLUDES_DEFAULT])
 AM_CONDITIONAL(HAVE_SYS_SOCKET_H, test "x$HAVE_SYS_SOCKET_H" = "xyes")
 
 dnl used in gst-libs/gst/rtsp
@@ -211,7 +215,9 @@ AC_SUBST(HSTRERROR_LIBS)
 LIBS="$save_libs"
 
 dnl used in gst-libs/gst/pbutils and associated unit test
-AC_CHECK_HEADERS([process.h sys/types.h sys/wait.h sys/stat.h])
+AC_CHECK_HEADERS([process.h sys/types.h sys/wait.h sys/stat.h], [], [], [AC_INCLUDES_DEFAULT])
+
+AC_CHECK_HEADERS([xmmintrin.h emmintrin.h])
 
 dnl ffmpegcolorspace includes _stdint.h
 dnl also, Windows does not have long long
@@ -259,7 +265,7 @@ AC_CHECK_FUNC(gethostbyname,,[AC_CHECK_LIB(nsl,gethostbyname)])
 dnl *** checks for dependency libraries ***
 
 dnl GLib is required
-AG_GST_GLIB_CHECK([2.22])
+AG_GST_GLIB_CHECK([2.24])
 
 ORC_CHECK([0.4.11])
 
@@ -281,24 +287,11 @@ AC_SUBST(GST_PREFIX)
 dnl GTK is optional and only used in examples
 HAVE_GTK=no
 HAVE_GTK_X11=no
-GTK2_REQ=2.14.0
-GTK3_REQ=2.91.3
+GTK_REQ=3.0.0
 if test "x$BUILD_EXAMPLES" = "xyes"; then
-  AC_MSG_CHECKING([which gtk+ version to compile examples against (optional)])
-  AC_ARG_WITH([gtk],
-    AC_HELP_STRING([--with-gtk=3.0|2.0],
-                   [which gtk+ version to compile against (default: 2.0)]),
-    [case "$with_gtk" in
-        2.0) GTK_REQ=$GTK2_REQ ;;
-        3.0) GTK_REQ=$GTK3_REQ ;;
-        *) AC_MSG_ERROR([invalid gtk+ version specified]);;
-    esac],
-    [with_gtk=2.0
-     GTK_REQ=$GTK2_REQ])
-  AC_MSG_RESULT([$with_gtk (>= $GTK_REQ)])
-  PKG_CHECK_MODULES(GTK, gtk+-$with_gtk >= $GTK_REQ, HAVE_GTK=yes, HAVE_GTK=no)
+  PKG_CHECK_MODULES(GTK, gtk+-3.0 >= $GTK_REQ, HAVE_GTK=yes, HAVE_GTK=no)
   dnl some examples need gtk+-x11
-  PKG_CHECK_MODULES(GTK_X11, gtk+-x11-$with_gtk >= $GTK_REQ, HAVE_GTK_X11=yes, HAVE_GTK_X11=no)
+  PKG_CHECK_MODULES(GTK_X11, gtk+-x11-3.0 >= $GTK_REQ, HAVE_GTK_X11=yes, HAVE_GTK_X11=no)
   AC_SUBST(GTK_LIBS)
   AC_SUBST(GTK_CFLAGS)
 fi
@@ -342,16 +335,15 @@ AM_CONDITIONAL(HAVE_LINUX_JOYSTICK_HEADERS, test "x$HAVE_LINUX_JOYSTICK_HEADERS"
 dnl Check for -Bsymbolic-functions linker flag used to avoid
 dnl intra-library PLT jumps, if available.
 AC_ARG_ENABLE(Bsymbolic,
-              [AC_HELP_STRING([--disable-Bsymbolic],
-                              [avoid linking with -Bsymbolic])],,
+              [AS_HELP_STRING([--disable-Bsymbolic],[avoid linking with -Bsymbolic])],,
               [SAVED_LDFLAGS="${LDFLAGS}"
                AC_MSG_CHECKING([for -Bsymbolic-functions linker flag])
                LDFLAGS=-Wl,-Bsymbolic-functions
-               AC_TRY_LINK([], [int main (void) { return 0; }],
+               AC_LINK_IFELSE([AC_LANG_PROGRAM([[]], [[int main (void) { return 0; }]])],[
                            AC_MSG_RESULT(yes)
-                           enable_Bsymbolic=yes,
+                           enable_Bsymbolic=yes],[
                            AC_MSG_RESULT(no)
-                           enable_Bsymbolic=no)
+                           enable_Bsymbolic=no])
                LDFLAGS="${SAVED_LDFLAGS}"])
 
 
@@ -370,20 +362,25 @@ AG_GST_SET_PACKAGE_RELEASE_DATETIME_WITH_NANO([$PACKAGE_VERSION_NANO],
   ["${srcdir}/gst-plugins-base.doap"],
   [$PACKAGE_VERSION_MAJOR.$PACKAGE_VERSION_MINOR.$PACKAGE_VERSION_MICRO])
 
+# set by AG_GST_PARSE_SUBSYSTEM_DISABLES above
+dnl make sure it doesn't complain about unused variables if debugging is disabled
+NO_WARNINGS=""
+AG_GST_CHECK_GST_DEBUG_DISABLED([NO_WARNINGS="-Wno-unused"], [NO_WARNINGS=""])
+
 dnl define an ERROR_CFLAGS Makefile variable
 dnl -Wformat-nonliteral - see ext/pango/gstclockoverlay.c and http://gcc.gnu.org/bugzilla/show_bug.cgi?id=39438
-AG_GST_SET_ERROR_CFLAGS($GST_GIT, [
+AG_GST_SET_ERROR_CFLAGS($FATAL_WARNINGS, [
     -Wmissing-declarations -Wmissing-prototypes -Wredundant-decls -Wundef
     -Wwrite-strings -Wformat-nonliteral -Wformat-security
     -Winit-self -Wmissing-include-dirs -Waddress -Waggregate-return
-    -Wno-multichar -Wnested-externs ])
+    -Wno-multichar -Wnested-externs $NO_WARNINGS])
 
 dnl define an ERROR_CXXFLAGS Makefile variable
-AG_GST_SET_ERROR_CXXFLAGS($GST_GIT, [
+AG_GST_SET_ERROR_CXXFLAGS($FATAL_WARNINGS, [
     -Wmissing-declarations -Wredundant-decls -Wundef
     -Wwrite-strings -Wformat-nonliteral -Wformat-security
     -Winit-self -Wmissing-include-dirs -Waddress -Waggregate-return
-    -Wno-multichar])
+    -Wno-multichar $NO_WARNINGS])
 
 dnl define correct level for debugging messages
 AG_GST_SET_LEVEL_DEFAULT($GST_GIT)
@@ -455,7 +452,7 @@ fi
 
 dnl iso-codes is optional, used by libgsttag
 AC_ARG_ENABLE(iso-codes,
-AC_HELP_STRING([--enable-iso-codes],[use iso-codes if installed]),
+AS_HELP_STRING([--enable-iso-codes],[use iso-codes if installed]),
 [case "${enableval}" in
   yes) enable_iso_codes=yes ;;
   no)  enable_iso_codes=no ;;
@@ -503,6 +500,20 @@ else
   AM_CONDITIONAL(USE_ISO_CODES, false)
 fi
 
+dnl *** zlib is optionally used by id3 tag parsing in libgsttag ***
+translit(dnm, m, l) AM_CONDITIONAL(USE_ZLIB, true)
+AG_GST_CHECK_FEATURE(ZLIB, [zlib support for ID3 parsing in libgsttag],, [
+  PKG_CHECK_MODULES(ZLIB, [ zlib ], [
+      HAVE_ZLIB="yes"
+    ], [
+      AG_GST_CHECK_LIBHEADER(ZLIB, z, uncompress,, zlib.h, [
+        HAVE_ZLIB="yes"
+        ZLIB_LIBS="-lz"
+        AC_SUBST(ZLIB_LIBS)
+      ])
+    ])
+])
+
 dnl *** sys plug-ins ***
 
 echo
@@ -520,7 +531,7 @@ AG_GST_CHECK_FEATURE(X, [X libraries and plugins],
   CPPFLAGS="$CPPFLAGS $X_CFLAGS"
 
   dnl now try to find the HEADER
-  AC_CHECK_HEADER(X11/Xlib.h, HAVE_X="yes", HAVE_X="no")
+  AC_CHECK_HEADER([X11/Xlib.h], [HAVE_X="yes"], [HAVE_X="no"], [AC_INCLUDES_DEFAULT])
 
   if test "x$HAVE_X" = "xno"
   then
@@ -538,7 +549,7 @@ AG_GST_CHECK_FEATURE(X, [X libraries and plugins],
   CFLAGS="$ac_cflags_save"
   CPPFLAGS="$ac_cppflags_save"
 ])
-  
+
 dnl Check for Xv extension
 translit(dnm, m, l) AM_CONDITIONAL(USE_XVIDEO, true)
 AG_GST_CHECK_FEATURE(XVIDEO, [X11 XVideo extensions],
@@ -550,24 +561,24 @@ dnl check for X Shm
 translit(dnm, m, l) AM_CONDITIONAL(USE_XSHM, true)
 AG_GST_CHECK_FEATURE(XSHM, [X Shared Memory extension], , [
   if test x$HAVE_X = xyes; then
-    AC_CHECK_LIB(Xext, XShmAttach, 
+    AC_CHECK_LIB(Xext, XShmAttach,
 		 HAVE_XSHM="yes", HAVE_XSHM="no",
-		 $X_LIBS) 
+		 $X_LIBS)
     if test "x$HAVE_XSHM" = "xyes"; then
       XSHM_LIBS="-lXext"
     else
       dnl On AIX, it is in XextSam instead, but we still need -lXext
-      AC_CHECK_LIB(XextSam, XShmAttach, 
+      AC_CHECK_LIB(XextSam, XShmAttach,
 		   HAVE_XSHM="yes", HAVE_XSHM="no",
-		   $X_LIBS) 
+		   $X_LIBS)
       if test "x$HAVE_XSHM" = "xyes"; then
 	XSHM_LIBS="-lXext -lXextSam"
       fi
     fi
   fi
-], , [ 
-  AC_SUBST(HAVE_XSHM) 
-  AC_SUBST(XSHM_LIBS) 
+], , [
+  AC_SUBST(HAVE_XSHM)
+  AC_SUBST(XSHM_LIBS)
 ])
 
 dnl v4l/v4l2 checks have been moved down because they require X
@@ -643,17 +654,17 @@ AG_GST_CHECK_FEATURE(CDPARANOIA, [CDParanoia], cdparanoia, [
   PKG_CHECK_MODULES(CDPARANOIA, cdparanoia-3 >= 10.2, [
     HAVE_CDPARANOIA="yes"
   ], [
-    AG_GST_CHECK_LIBHEADER(CDPARANOIA, cdda_interface, 
-                        cdda_open, -lm, 
-                        cdda_interface.h, 
+    AG_GST_CHECK_LIBHEADER(CDPARANOIA, cdda_interface,
+                        cdda_open, -lm,
+                        cdda_interface.h,
                         CDPARANOIA_LIBS="-lcdda_interface -lcdda_paranoia"
                         HEADER_DIR="no"
                         FOUND_CDPARANOIA="yes")
     if test "x$FOUND_CDPARANOIA" != "xyes";
     then
-      AG_GST_CHECK_LIBHEADER(CDPARANOIA, cdda_interface, 
-                          cdda_open, -lm, 
-                          cdda/cdda_interface.h, 
+      AG_GST_CHECK_LIBHEADER(CDPARANOIA, cdda_interface,
+                          cdda_open, -lm,
+                          cdda/cdda_interface.h,
                           CDPARANOIA_LIBS="-lcdda_interface -lcdda_paranoia"
                           HEADER_DIR="yes"
                           FOUND_CDPARANOIA="yes")
@@ -778,7 +789,7 @@ AG_GST_CHECK_FEATURE(OGG, [Xiph Ogg library], ogg, [
 dnl *** pango ***
 translit(dnm, m, l) AM_CONDITIONAL(USE_PANGO, true)
 AG_GST_CHECK_FEATURE(PANGO, [Pango font rendering], pango, [
-  AG_GST_PKG_CHECK_MODULES(PANGO, pango >= 1.16.0  pangocairo >= 1.16.0)
+  AG_GST_PKG_CHECK_MODULES(PANGO, pango >= 1.22.0  pangocairo >= 1.22.0)
 ])
 
 dnl *** theora ***
@@ -801,14 +812,14 @@ AG_GST_CHECK_FEATURE(VORBIS, [Xiph Vorbis audio codec], vorbis, [
 
 if test "x$HAVE_VORBIS" = "xyes"; then
   ac_cflags_save="$CFLAGS"
-  AC_COMPILE_IFELSE(
-    AC_LANG_PROGRAM([
+  AC_COMPILE_IFELSE([
+    AC_LANG_PROGRAM([[
 #include <vorbis/codec.h>
-                     ],[
+                     ]],[[
 vorbis_dsp_state *v;
 
 vorbis_synthesis_restart (v);
-                     ]), HAVE_VSR=yes, HAVE_VSR=no)
+                     ]])], HAVE_VSR=yes, HAVE_VSR=no)
   if test "x$HAVE_VSR" = "xyes"; then
     AC_DEFINE_UNQUOTED(HAVE_VORBIS_SYNTHESIS_RESTART, 1,
                        [defined if vorbis_synthesis_restart is present])
@@ -886,8 +897,8 @@ AC_SUBST(GST_PLUGINS_BASE_CFLAGS)
 
 dnl FIXME: do we want to rename to GST_ALL_* ?
 dnl add GST_OPTION_CFLAGS, but overridable
-GST_CXXFLAGS="$GLIB_CFLAGS $GST_CFLAGS $GLIB_EXTRA_CFLAGS \$(GST_OPTION_CXXFLAGS)"
-GST_CFLAGS="$GLIB_CFLAGS $GST_CFLAGS $GLIB_EXTRA_CFLAGS \$(GST_OPTION_CFLAGS)"
+GST_CXXFLAGS="$GLIB_CFLAGS $GST_CFLAGS \$(GLIB_EXTRA_CFLAGS) \$(GST_OPTION_CXXFLAGS)"
+GST_CFLAGS="$GLIB_CFLAGS $GST_CFLAGS \$(GLIB_EXTRA_CFLAGS) \$(GST_OPTION_CFLAGS)"
 AC_SUBST(GST_CFLAGS)
 AC_SUBST(GST_CXXFLAGS)
 dnl add GCOV libs because libtool strips -fprofile-arcs -ftest-coverage
@@ -1004,14 +1015,16 @@ tests/Makefile
 tests/check/Makefile
 tests/examples/Makefile
 tests/examples/app/Makefile
+tests/examples/audio/Makefile
 tests/examples/dynamic/Makefile
 tests/examples/encoding/Makefile
+tests/examples/fft/Makefile
 tests/examples/gio/Makefile
 tests/examples/overlay/Makefile
 tests/examples/seek/Makefile
 tests/examples/snapshot/Makefile
+tests/examples/playback/Makefile
 tests/examples/playrec/Makefile
-tests/examples/volume/Makefile
 tests/examples/v4l/Makefile
 tests/files/Makefile
 tests/icles/Makefile

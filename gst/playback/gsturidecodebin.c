@@ -24,6 +24,10 @@
  * handle the given #GstURIDecodeBin:uri scheme and connects it to a decodebin2.
  */
 
+/* FIXME 0.11: suppress warnings for deprecated API such as GValueArray
+ * with newer GLib versions (>= 2.31.0) */
+#define GLIB_DISABLE_DEPRECATION_WARNINGS
+
 #ifdef HAVE_CONFIG_H
 #  include "config.h"
 #endif
@@ -37,6 +41,11 @@
 #include "gstplay-marshal.h"
 #include "gstplay-enum.h"
 #include "gstrawcaps.h"
+
+#include "gst/glib-compat-private.h"
+
+/* From gstdecodebin2.c */
+gint _decode_bin_compare_factories_func (gconstpointer p1, gconstpointer p2);
 
 #define GST_TYPE_URI_DECODE_BIN \
   (gst_uri_decode_bin_get_type())
@@ -56,6 +65,12 @@ typedef struct _GstURIDecodeBinClass GstURIDecodeBinClass;
 #define GST_URI_DECODE_BIN_GET_LOCK(dec) (((GstURIDecodeBin*)(dec))->lock)
 #define GST_URI_DECODE_BIN_LOCK(dec) (g_mutex_lock(GST_URI_DECODE_BIN_GET_LOCK(dec)))
 #define GST_URI_DECODE_BIN_UNLOCK(dec) (g_mutex_unlock(GST_URI_DECODE_BIN_GET_LOCK(dec)))
+
+typedef struct _GstURIDecodeBinStream
+{
+  gulong probe_id;
+  guint bitrate;
+} GstURIDecodeBinStream;
 
 /**
  * GstURIDecodeBin
@@ -91,7 +106,7 @@ struct _GstURIDecodeBin
   guint have_type_id;           /* have-type signal id from typefind */
   GSList *decodebins;
   GSList *pending_decodebins;
-  GSList *srcpads;
+  GHashTable *streams;
   gint numpads;
 
   /* for dynamic sources */
@@ -99,7 +114,7 @@ struct _GstURIDecodeBin
   guint src_nmp_sig_id;         /* no-more-pads signal id */
   gint pending;
 
-  gboolean async_pending;       /* async-start has been emited */
+  gboolean async_pending;       /* async-start has been emitted */
 
   gboolean expose_allstreams;   /* Whether to expose unknow type streams or not */
 
@@ -126,7 +141,7 @@ struct _GstURIDecodeBinClass
     GstAutoplugSelectResult (*autoplug_select) (GstElement * element,
       GstPad * pad, GstCaps * caps, GstElementFactory * factory);
 
-  /* emited when all data is decoded */
+  /* emitted when all data is decoded */
   void (*drained) (GstElement * element);
 };
 
@@ -207,8 +222,7 @@ gst_uri_decode_bin_base_init (gpointer g_class)
 {
   GstElementClass *gstelement_class = GST_ELEMENT_CLASS (g_class);
 
-  gst_element_class_add_pad_template (gstelement_class,
-      gst_static_pad_template_get (&srctemplate));
+  gst_element_class_add_static_pad_template (gstelement_class, &srctemplate);
   gst_element_class_set_details_simple (gstelement_class,
       "URI Decoder", "Generic/Bin/Decoder",
       "Autoplug and decode an URI to raw media",
@@ -291,6 +305,8 @@ gst_uri_decode_bin_update_factories_list (GstURIDecodeBin * dec)
     dec->factories =
         gst_element_factory_list_get_elements
         (GST_ELEMENT_FACTORY_TYPE_DECODABLE, GST_RANK_MARGINAL);
+    dec->factories =
+        g_list_sort (dec->factories, _decode_bin_compare_factories_func);
     dec->factories_cookie = gst_default_registry_get_feature_list_cookie ();
   }
 }
@@ -507,7 +523,7 @@ gst_uri_decode_bin_class_init (GstURIDecodeBinClass * klass)
    * @pad: The #GstPad.
    * @caps: The #GstCaps found.
    *
-   * This function is emited when an array of possible factories for @caps on
+   * This function is emitted when an array of possible factories for @caps on
    * @pad is needed. Uridecodebin will by default return an array with all
    * compatible factories, sorted by rank.
    *
@@ -541,7 +557,7 @@ gst_uri_decode_bin_class_init (GstURIDecodeBinClass * klass)
    * @factories: A #GValueArray of possible #GstElementFactory to use.
    *
    * Once decodebin2 has found the possible #GstElementFactory objects to try
-   * for @caps on @pad, this signal is emited. The purpose of the signal is for
+   * for @caps on @pad, this signal is emitted. The purpose of the signal is for
    * the application to perform additional sorting or filtering on the element
    * factory array.
    *
@@ -576,7 +592,7 @@ gst_uri_decode_bin_class_init (GstURIDecodeBinClass * klass)
    *
    * This signal is emitted once uridecodebin has found all the possible
    * #GstElementFactory that can be used to handle the given @caps. For each of
-   * those factories, this signal is emited.
+   * those factories, this signal is emitted.
    *
    * The signal handler should return a #GST_TYPE_AUTOPLUG_SELECT_RESULT enum
    * value indicating what decodebin2 should do next.
@@ -935,7 +951,99 @@ source_no_more_pads (GstElement * element, GstURIDecodeBin * bin)
   no_more_pads_full (element, FALSE, bin);
 }
 
-/* Called by the signal handlers when a decodebin has 
+static void
+configure_stream_buffering (GstURIDecodeBin * decoder)
+{
+  GstElement *queue = NULL;
+  GHashTableIter iter;
+  gpointer key, value;
+  gint bitrate = 0;
+
+  /* automatic configuration enabled ? */
+  if (decoder->buffer_size != -1)
+    return;
+
+  GST_URI_DECODE_BIN_LOCK (decoder);
+  if (decoder->queue)
+    queue = gst_object_ref (decoder->queue);
+
+  g_hash_table_iter_init (&iter, decoder->streams);
+  while (g_hash_table_iter_next (&iter, &key, &value)) {
+    GstURIDecodeBinStream *stream = value;
+
+    if (stream->bitrate && bitrate >= 0)
+      bitrate += stream->bitrate;
+    else
+      bitrate = -1;
+  }
+  GST_URI_DECODE_BIN_UNLOCK (decoder);
+
+  GST_DEBUG_OBJECT (decoder, "overall bitrate %d", bitrate);
+  if (!queue)
+    return;
+
+  if (bitrate > 0) {
+    guint64 time;
+    guint bytes;
+
+    /* all streams have a bitrate;
+     * configure queue size based on queue duration using combined bitrate */
+    g_object_get (queue, "max-size-time", &time, NULL);
+    GST_DEBUG_OBJECT (decoder, "queue buffering time %" GST_TIME_FORMAT,
+        GST_TIME_ARGS (time));
+    if (time > 0) {
+      bytes = gst_util_uint64_scale (time, bitrate, 8 * GST_SECOND);
+      GST_DEBUG_OBJECT (decoder, "corresponds to buffer size %d", bytes);
+      g_object_set (queue, "max-size-bytes", bytes, NULL);
+    }
+  }
+
+  gst_object_unref (queue);
+}
+
+static gboolean
+decoded_pad_event_probe (GstPad * pad, GstEvent * event,
+    GstURIDecodeBin * decoder)
+{
+  GST_LOG_OBJECT (pad, "%s, decoder %p", GST_EVENT_TYPE_NAME (event), decoder);
+
+  /* look for a bitrate tag */
+  switch (GST_EVENT_TYPE (event)) {
+    case GST_EVENT_TAG:
+    {
+      GstTagList *list;
+      guint bitrate = 0;
+      GstURIDecodeBinStream *stream;
+
+      gst_event_parse_tag (event, &list);
+      if (!gst_tag_list_get_uint_index (list, GST_TAG_NOMINAL_BITRATE, 0,
+              &bitrate)) {
+        gst_tag_list_get_uint_index (list, GST_TAG_BITRATE, 0, &bitrate);
+      }
+      GST_DEBUG_OBJECT (pad, "found bitrate %u", bitrate);
+      if (bitrate) {
+        GST_URI_DECODE_BIN_LOCK (decoder);
+        stream = g_hash_table_lookup (decoder->streams, pad);
+        GST_URI_DECODE_BIN_UNLOCK (decoder);
+        if (stream) {
+          stream->bitrate = bitrate;
+          /* no longer need this probe now */
+          gst_pad_remove_event_probe (pad, stream->probe_id);
+          /* configure buffer if possible */
+          configure_stream_buffering (decoder);
+        }
+      }
+      break;
+    }
+    default:
+      break;
+  }
+
+  /* never drop */
+  return TRUE;
+}
+
+/* Called by the signal handlers when a decodebin has
  * found a new raw pad.  
  */
 static void
@@ -945,6 +1053,7 @@ new_decoded_pad_cb (GstElement * element, GstPad * pad, gboolean last,
   GstPad *newpad;
   GstPadTemplate *pad_tmpl;
   gchar *padname;
+  GstURIDecodeBinStream *stream;
 
   GST_DEBUG_OBJECT (element, "new decoded pad, name: <%s>. Last: %d",
       GST_PAD_NAME (pad), last);
@@ -962,10 +1071,18 @@ new_decoded_pad_cb (GstElement * element, GstPad * pad, gboolean last,
   /* store ref to the ghostpad so we can remove it */
   g_object_set_data (G_OBJECT (pad), "uridecodebin.ghostpad", newpad);
 
+  /* add event probe to monitor tags */
+  stream = g_slice_alloc0 (sizeof (GstURIDecodeBinStream));
+  stream->probe_id =
+      gst_pad_add_event_probe (pad, G_CALLBACK (decoded_pad_event_probe),
+      decoder);
+  GST_URI_DECODE_BIN_LOCK (decoder);
+  g_hash_table_insert (decoder->streams, pad, stream);
+  GST_URI_DECODE_BIN_UNLOCK (decoder);
+
   gst_pad_set_active (newpad, TRUE);
   gst_element_add_pad (GST_ELEMENT_CAST (decoder), newpad);
 }
-
 
 static gboolean
 source_pad_event_probe (GstPad * pad, GstEvent * event,
@@ -1092,6 +1209,7 @@ static GstElement *
 gen_source_element (GstURIDecodeBin * decoder)
 {
   GstElement *source;
+  GParamSpec *pspec;
 
   if (!decoder->uri)
     goto no_uri;
@@ -1125,13 +1243,32 @@ gen_source_element (GstURIDecodeBin * decoder)
     g_object_set (source, "iradio-mode", TRUE, NULL);
   }
 
-  if (g_object_class_find_property (G_OBJECT_GET_CLASS (source),
-          "connection-speed")) {
-    GST_DEBUG_OBJECT (decoder,
-        "setting connection-speed=%d to source element",
-        decoder->connection_speed / 1000);
-    g_object_set (source, "connection-speed",
-        decoder->connection_speed / 1000, NULL);
+  if ((pspec = g_object_class_find_property (G_OBJECT_GET_CLASS (source),
+              "connection-speed"))) {
+    guint speed = decoder->connection_speed / 1000;
+    gboolean wrong_type = FALSE;
+
+    if (G_PARAM_SPEC_TYPE (pspec) == G_TYPE_PARAM_UINT) {
+      GParamSpecUInt *pspecuint = G_PARAM_SPEC_UINT (pspec);
+
+      speed = CLAMP (speed, pspecuint->minimum, pspecuint->maximum);
+    } else if (G_PARAM_SPEC_TYPE (pspec) == G_TYPE_PARAM_INT) {
+      GParamSpecInt *pspecint = G_PARAM_SPEC_INT (pspec);
+
+      speed = CLAMP (speed, pspecint->minimum, pspecint->maximum);
+    } else {
+      GST_WARNING_OBJECT (decoder, "The connection speed property %i of type %s"
+          " is not usefull not setting it", speed,
+          g_type_name (G_PARAM_SPEC_TYPE (pspec)));
+      wrong_type = TRUE;
+    }
+
+    if (wrong_type == FALSE) {
+      g_object_set (source, "connection-speed", speed, NULL);
+
+      GST_DEBUG_OBJECT (decoder,
+          "setting connection-speed=%d to source element", speed);
+    }
   }
   if (g_object_class_find_property (G_OBJECT_GET_CLASS (source),
           "subtitle-encoding")) {
@@ -1292,7 +1429,7 @@ analyse_source (GstURIDecodeBin * decoder, gboolean * is_raw,
         gst_iterator_resync (pads_iter);
         break;
       case GST_ITERATOR_OK:
-        /* we now officially have an ouput pad */
+        /* we now officially have an output pad */
         *have_out = TRUE;
 
         /* if FALSE, this pad has no caps and we continue with the next pad. */
@@ -1401,6 +1538,8 @@ remove_decoders (GstURIDecodeBin * bin, gboolean force)
       caps = DEFAULT_CAPS;
       g_object_set (decoder, "caps", caps, NULL);
       gst_caps_unref (caps);
+      /* make it freshly floating again */
+      GST_OBJECT_FLAG_SET (decoder, GST_OBJECT_FLOATING);
 
       bin->pending_decodebins =
           g_slist_prepend (bin->pending_decodebins, decoder);
@@ -1422,22 +1561,6 @@ remove_decoders (GstURIDecodeBin * bin, gboolean force)
 
   /* Don't loose the SOURCE flag */
   GST_OBJECT_FLAG_SET (bin, GST_ELEMENT_IS_SOURCE);
-}
-
-static void
-remove_pads (GstURIDecodeBin * bin)
-{
-  GSList *walk;
-
-  for (walk = bin->srcpads; walk; walk = g_slist_next (walk)) {
-    GstPad *pad = GST_PAD_CAST (walk->data);
-
-    GST_DEBUG_OBJECT (bin, "removing old pad");
-    gst_pad_set_active (pad, FALSE);
-    gst_element_remove_pad (GST_ELEMENT_CAST (bin), pad);
-  }
-  g_slist_free (bin->srcpads);
-  bin->srcpads = NULL;
 }
 
 static void
@@ -1574,9 +1697,9 @@ make_decoder (GstURIDecodeBin * decoder)
   if (decoder->caps)
     g_object_set (decodebin, "caps", decoder->caps, NULL);
 
-  /* Propagate expose-all-streams property */
+  /* Propagate expose-all-streams and connection-speed properties */
   g_object_set (decodebin, "expose-all-streams", decoder->expose_allstreams,
-      NULL);
+      "connection-speed", decoder->connection_speed / 1000, NULL);
 
   if (!decoder->is_stream) {
     /* propagate the use-buffering property but only when we are not already
@@ -1672,7 +1795,7 @@ type_found (GstElement * typefind, guint probability,
     gchar *temp_template, *filename;
     const gchar *tmp_dir, *prgname;
 
-    tmp_dir = g_get_tmp_dir ();
+    tmp_dir = g_get_user_cache_dir ();
     prgname = g_get_prgname ();
     if (prgname == NULL)
       prgname = "GStreamer";
@@ -1791,6 +1914,12 @@ could_not_link:
   }
 }
 
+static void
+free_stream (gpointer value)
+{
+  g_slice_free (GstURIDecodeBinStream, value);
+}
+
 /* remove source and all related elements */
 static void
 remove_source (GstURIDecodeBin * bin)
@@ -1823,6 +1952,10 @@ remove_source (GstURIDecodeBin * bin)
     gst_element_set_state (bin->typefind, GST_STATE_NULL);
     gst_bin_remove (GST_BIN_CAST (bin), bin->typefind);
     bin->typefind = NULL;
+  }
+  if (bin->streams) {
+    g_hash_table_destroy (bin->streams);
+    bin->streams = NULL;
   }
   /* Don't loose the SOURCE flag */
   GST_OBJECT_FLAG_SET (bin, GST_ELEMENT_IS_SOURCE);
@@ -1886,6 +2019,21 @@ could_not_link:
   }
 }
 
+static gboolean
+is_live_source (GstElement * source)
+{
+  GObjectClass *source_class = NULL;
+  gboolean is_live = FALSE;
+
+  source_class = G_OBJECT_GET_CLASS (source);
+  if (!g_object_class_find_property (source_class, "is-live"))
+    return FALSE;
+
+  g_object_get (G_OBJECT (source), "is-live", &is_live, NULL);
+
+  return is_live;
+}
+
 /* construct and run the source and decoder elements until we found
  * all the streams or until a preroll queue has been filled.
 */
@@ -1915,8 +2063,14 @@ setup_source (GstURIDecodeBin * decoder)
   g_signal_emit (decoder, gst_uri_decode_bin_signals[SIGNAL_SOURCE_SETUP],
       0, decoder->source);
 
+  if (is_live_source (decoder->source))
+    decoder->is_stream = FALSE;
+
   /* remove the old decoders now, if any */
   remove_decoders (decoder, FALSE);
+
+  /* stream admin setup */
+  decoder->streams = g_hash_table_new_full (NULL, NULL, NULL, free_stream);
 
   /* see if the source element emits raw audio/video all by itself,
    * if so, we can create streams for the pads and be done with it.
@@ -2403,14 +2557,12 @@ gst_uri_decode_bin_change_state (GstElement * element,
     case GST_STATE_CHANGE_PAUSED_TO_READY:
       GST_DEBUG ("paused to ready");
       remove_decoders (decoder, FALSE);
-      remove_pads (decoder);
       remove_source (decoder);
       do_async_done (decoder);
       break;
     case GST_STATE_CHANGE_READY_TO_NULL:
       GST_DEBUG ("ready to null");
       remove_decoders (decoder, TRUE);
-      remove_pads (decoder);
       remove_source (decoder);
       break;
     default:

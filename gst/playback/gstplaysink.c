@@ -1,5 +1,6 @@
 /* GStreamer
  * Copyright (C) <2007> Wim Taymans <wim.taymans@gmail.com>
+ * Copyright (C) <2011> Sebastian Dröge <sebastian.droege@collabora.co.uk>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Library General Public
@@ -21,15 +22,25 @@
 #include "config.h"
 #endif
 
+/* FIXME 0.11: suppress warnings for deprecated API such as GStaticRecMutex
+ * with newer GLib versions (>= 2.31.0) */
+#define GLIB_DISABLE_DEPRECATION_WARNINGS
+
 #include <string.h>
 #include <gst/gst.h>
 
 #include <gst/gst-i18n-plugin.h>
 #include <gst/pbutils/pbutils.h>
 #include <gst/video/video.h>
+#include <gst/interfaces/streamvolume.h>
+#include <gst/interfaces/colorbalance.h>
+#include <gst/interfaces/xoverlay.h>
+#include <gst/interfaces/navigation.h>
 
 #include "gstplaysink.h"
 #include "gststreamsynchronizer.h"
+#include "gstplaysinkvideoconvert.h"
+#include "gstplaysinkaudioconvert.h"
 
 GST_DEBUG_CATEGORY_STATIC (gst_play_sink_debug);
 #define GST_CAT_DEFAULT gst_play_sink_debug
@@ -37,9 +48,44 @@ GST_DEBUG_CATEGORY_STATIC (gst_play_sink_debug);
 #define VOLUME_MAX_DOUBLE 10.0
 
 #define DEFAULT_FLAGS             GST_PLAY_FLAG_AUDIO | GST_PLAY_FLAG_VIDEO | GST_PLAY_FLAG_TEXT | \
-                                  GST_PLAY_FLAG_SOFT_VOLUME
+                                  GST_PLAY_FLAG_SOFT_VOLUME | GST_PLAY_FLAG_SOFT_COLORBALANCE
 
 #define GST_PLAY_CHAIN(c) ((GstPlayChain *)(c))
+
+/* enum types */
+/**
+ * GstPlaySinkSendEventMode:
+ * @MODE_DEFAULT: default GstBin's send_event handling
+ * @MODE_FIRST: send event only to the first sink that return true
+ *
+ * Send event handling to use
+ */
+typedef enum
+{
+  MODE_DEFAULT = 0,
+  MODE_FIRST = 1
+} GstPlaySinkSendEventMode;
+
+
+#define GST_TYPE_PLAY_SINK_SEND_EVENT_MODE (gst_play_sink_send_event_mode_get_type ())
+static GType
+gst_play_sink_send_event_mode_get_type (void)
+{
+  static GType gtype = 0;
+
+  if (gtype == 0) {
+    static const GEnumValue values[] = {
+      {MODE_DEFAULT, "Default GstBin's send_event handling (default)",
+          "default"},
+      {MODE_FIRST, "Sends the event to sinks until the first one handles it",
+          "first"},
+      {0, NULL, NULL}
+    };
+
+    gtype = g_enum_register_static ("GstPlaySinkSendEventMode", values);
+  }
+  return gtype;
+}
 
 /* holds the common data fields for the audio and video pipelines. We keep them
  * in a structure to more easily have all the info available. */
@@ -58,7 +104,6 @@ typedef struct
   GstPad *sinkpad;
   GstElement *queue;
   GstElement *conv;
-  GstElement *resample;
   GstElement *volume;           /* element with the volume property */
   gboolean sink_volume;         /* if the volume was provided by the sink */
   GstElement *mute;             /* element with the mute property */
@@ -80,7 +125,6 @@ typedef struct
   GstPad *sinkpad;
   GstElement *queue;
   GstElement *conv;
-  GstElement *scale;
   GstElement *sink;
   gboolean async;
   GstElement *ts_offset;
@@ -126,6 +170,19 @@ typedef struct
   g_static_rec_mutex_unlock (GST_PLAY_SINK_GET_LOCK (playsink)); \
 } G_STMT_END
 
+#define PENDING_FLAG_SET(playsink, flagtype) \
+  ((playsink->pending_blocked_pads) |= (1 << flagtype))
+#define PENDING_FLAG_UNSET(playsink, flagtype) \
+  ((playsink->pending_blocked_pads) &= ~(1 << flagtype))
+#define PENDING_FLAG_IS_SET(playsink, flagtype) \
+  ((playsink->pending_blocked_pads) & (1 << flagtype))
+#define PENDING_VIDEO_BLOCK(playsink) \
+  ((playsink->pending_blocked_pads) & (1 << GST_PLAY_SINK_TYPE_VIDEO_RAW | 1 << GST_PLAY_SINK_TYPE_VIDEO))
+#define PENDING_AUDIO_BLOCK(playsink) \
+  ((playsink->pending_blocked_pads) & (1 << GST_PLAY_SINK_TYPE_AUDIO_RAW | 1 << GST_PLAY_SINK_TYPE_AUDIO))
+#define PENDING_TEXT_BLOCK(playsink) \
+  PENDING_FLAG_IS_SET(playsink, GST_PLAY_SINK_TYPE_TEXT)
+
 struct _GstPlaySink
 {
   GstBin bin;
@@ -149,6 +206,7 @@ struct _GstPlaySink
   /* audio */
   GstPad *audio_pad;
   gboolean audio_pad_raw;
+  gboolean audio_pad_blocked;
   GstPad *audio_srcpad_stream_synchronizer;
   GstPad *audio_sinkpad_stream_synchronizer;
   /* audio tee */
@@ -159,12 +217,16 @@ struct _GstPlaySink
   /* video */
   GstPad *video_pad;
   gboolean video_pad_raw;
+  gboolean video_pad_blocked;
   GstPad *video_srcpad_stream_synchronizer;
   GstPad *video_sinkpad_stream_synchronizer;
   /* text */
   GstPad *text_pad;
+  gboolean text_pad_blocked;
   GstPad *text_srcpad_stream_synchronizer;
   GstPad *text_sinkpad_stream_synchronizer;
+
+  guint32 pending_blocked_pads;
 
   /* properties */
   GstElement *audio_sink;
@@ -180,6 +242,41 @@ struct _GstPlaySink
   gboolean volume_changed;      /* volume/mute changed while no audiochain */
   gboolean mute_changed;        /* ... has been created yet */
   gint64 av_offset;
+  GstPlaySinkSendEventMode send_event_mode;
+  gboolean force_aspect_ratio;
+
+  /* xoverlay proxy interface */
+  GstXOverlay *xoverlay_element;        /* protected with LOCK */
+  gboolean xoverlay_handle_set;
+  guintptr xoverlay_handle;
+  gboolean xoverlay_render_rectangle_set;
+  gint xoverlay_x, xoverlay_y, xoverlay_width, xoverlay_height;
+  gboolean xoverlay_handle_events_set;
+  gboolean xoverlay_handle_events;
+
+  /* colorbalance proxy interface */
+  GstColorBalance *colorbalance_element;
+  GList *colorbalance_channels; /* CONTRAST, BRIGHTNESS, HUE, SATURATION */
+  gint colorbalance_values[4];
+
+  /* sending audio/video flushes break stream changes when the pipeline
+   * is paused and played again in 0.10 */
+#if 0
+  GstSegment video_segment;
+  gboolean video_custom_flush_finished;
+  gboolean video_ignore_wrong_state;
+  gboolean video_pending_flush;
+
+  GstSegment audio_segment;
+  gboolean audio_custom_flush_finished;
+  gboolean audio_ignore_wrong_state;
+  gboolean audio_pending_flush;
+#endif
+
+  GstSegment text_segment;
+  gboolean text_custom_flush_finished;
+  gboolean text_ignore_wrong_state;
+  gboolean text_pending_flush;
 };
 
 struct _GstPlaySinkClass
@@ -191,18 +288,9 @@ struct _GstPlaySinkClass
   GstBuffer *(*convert_frame) (GstPlaySink * playsink, GstCaps * caps);
 };
 
-static GstStaticPadTemplate audiorawtemplate =
-GST_STATIC_PAD_TEMPLATE ("audio_raw_sink",
-    GST_PAD_SINK,
-    GST_PAD_REQUEST,
-    GST_STATIC_CAPS_ANY);
+
 static GstStaticPadTemplate audiotemplate =
 GST_STATIC_PAD_TEMPLATE ("audio_sink",
-    GST_PAD_SINK,
-    GST_PAD_REQUEST,
-    GST_STATIC_CAPS_ANY);
-static GstStaticPadTemplate videorawtemplate =
-GST_STATIC_PAD_TEMPLATE ("video_raw_sink",
     GST_PAD_SINK,
     GST_PAD_REQUEST,
     GST_STATIC_CAPS_ANY);
@@ -216,6 +304,19 @@ static GstStaticPadTemplate texttemplate = GST_STATIC_PAD_TEMPLATE ("text_sink",
     GST_PAD_REQUEST,
     GST_STATIC_CAPS_ANY);
 
+/* FIXME 0.11: Remove */
+static GstStaticPadTemplate audiorawtemplate =
+GST_STATIC_PAD_TEMPLATE ("audio_raw_sink",
+    GST_PAD_SINK,
+    GST_PAD_REQUEST,
+    GST_STATIC_CAPS_ANY);
+static GstStaticPadTemplate videorawtemplate =
+GST_STATIC_PAD_TEMPLATE ("video_raw_sink",
+    GST_PAD_SINK,
+    GST_PAD_REQUEST,
+    GST_STATIC_CAPS_ANY);
+
+
 /* props */
 enum
 {
@@ -228,6 +329,11 @@ enum
   PROP_VIS_PLUGIN,
   PROP_FRAME,
   PROP_AV_OFFSET,
+  PROP_VIDEO_SINK,
+  PROP_AUDIO_SINK,
+  PROP_TEXT_SINK,
+  PROP_SEND_EVENT_MODE,
+  PROP_FORCE_ASPECT_RATIO,
   PROP_LAST
 };
 
@@ -255,12 +361,32 @@ static GstStateChangeReturn gst_play_sink_change_state (GstElement * element,
 
 static void gst_play_sink_handle_message (GstBin * bin, GstMessage * message);
 
+/* sending audio/video flushes break stream changes when the pipeline
+ * is paused and played again in 0.10 */
+#if 0
+static gboolean gst_play_sink_video_sink_event (GstPad * pad, GstEvent * event);
+static GstFlowReturn gst_play_sink_video_sink_chain (GstPad * pad,
+    GstBuffer * buffer);
+static gboolean gst_play_sink_audio_sink_event (GstPad * pad, GstEvent * event);
+static GstFlowReturn gst_play_sink_audio_sink_chain (GstPad * pad,
+    GstBuffer * buffer);
+#endif
+static gboolean gst_play_sink_text_sink_event (GstPad * pad, GstEvent * event);
+static GstFlowReturn gst_play_sink_text_sink_chain (GstPad * pad,
+    GstBuffer * buffer);
+
 static void notify_volume_cb (GObject * object, GParamSpec * pspec,
     GstPlaySink * playsink);
 static void notify_mute_cb (GObject * object, GParamSpec * pspec,
     GstPlaySink * playsink);
 
 static void update_av_offset (GstPlaySink * playsink);
+
+static gboolean gst_play_sink_do_reconfigure (GstPlaySink * playsink);
+static void sinkpad_blocked_cb (GstPad * blockedpad, gboolean blocked,
+    gpointer user_data);
+
+static GQuark _playsink_reset_segment_event_marker_id = 0;
 
 void
 gst_play_marshal_BUFFER__BOXED (GClosure * closure,
@@ -295,7 +421,47 @@ gst_play_marshal_BUFFER__BOXED (GClosure * closure,
 
 /* static guint gst_play_sink_signals[LAST_SIGNAL] = { 0 }; */
 
-G_DEFINE_TYPE (GstPlaySink, gst_play_sink, GST_TYPE_BIN);
+static void gst_play_sink_implements_interface_init (gpointer g_iface,
+    gpointer g_iface_data);
+static void gst_play_sink_xoverlay_init (gpointer g_iface,
+    gpointer g_iface_data);
+static void gst_play_sink_navigation_init (gpointer g_iface,
+    gpointer g_iface_data);
+static void gst_play_sink_colorbalance_init (gpointer g_iface,
+    gpointer g_iface_data);
+
+static void
+_do_init (GType type)
+{
+  static const GInterfaceInfo impl_info = {
+    gst_play_sink_implements_interface_init,
+    NULL, NULL
+  };
+  static const GInterfaceInfo svol_info = {
+    NULL, NULL, NULL
+  };
+  static const GInterfaceInfo xov_info = {
+    gst_play_sink_xoverlay_init,
+    NULL, NULL
+  };
+  static const GInterfaceInfo nav_info = {
+    gst_play_sink_navigation_init,
+    NULL, NULL
+  };
+  static const GInterfaceInfo col_info = {
+    gst_play_sink_colorbalance_init,
+    NULL, NULL
+  };
+
+  g_type_add_interface_static (type, GST_TYPE_IMPLEMENTS_INTERFACE, &impl_info);
+  g_type_add_interface_static (type, GST_TYPE_STREAM_VOLUME, &svol_info);
+  g_type_add_interface_static (type, GST_TYPE_X_OVERLAY, &xov_info);
+  g_type_add_interface_static (type, GST_TYPE_NAVIGATION, &nav_info);
+  g_type_add_interface_static (type, GST_TYPE_COLOR_BALANCE, &col_info);
+}
+
+G_DEFINE_TYPE_WITH_CODE (GstPlaySink, gst_play_sink, GST_TYPE_BIN,
+    _do_init (g_define_type_id));
 
 static void
 gst_play_sink_class_init (GstPlaySinkClass * klass)
@@ -383,6 +549,71 @@ gst_play_sink_class_init (GstPlaySinkClass * klass)
           G_MININT64, G_MAXINT64, 0,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  /**
+   * GstPlaySink:video-sink:
+   *
+   * Set the used video sink element. NULL will use the default sink. playsink
+   * must be in %GST_STATE_NULL
+   *
+   * Since: 0.10.36
+   */
+  g_object_class_install_property (gobject_klass, PROP_VIDEO_SINK,
+      g_param_spec_object ("video-sink", "Video Sink",
+          "the video output element to use (NULL = default sink)",
+          GST_TYPE_ELEMENT, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  /**
+   * GstPlaySink:audio-sink:
+   *
+   * Set the used audio sink element. NULL will use the default sink. playsink
+   * must be in %GST_STATE_NULL
+   *
+   * Since: 0.10.36
+   */
+  g_object_class_install_property (gobject_klass, PROP_AUDIO_SINK,
+      g_param_spec_object ("audio-sink", "Audio Sink",
+          "the audio output element to use (NULL = default sink)",
+          GST_TYPE_ELEMENT, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /**
+   * GstPlaySink:text-sink:
+   *
+   * Set the used text sink element. NULL will use the default sink. playsink
+   * must be in %GST_STATE_NULL
+   *
+   * Since: 0.10.36
+   */
+  g_object_class_install_property (gobject_klass, PROP_TEXT_SINK,
+      g_param_spec_object ("text-sink", "Text sink",
+          "the text output element to use (NULL = default subtitleoverlay)",
+          GST_TYPE_ELEMENT, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /**
+   * GstPlaySink::send-event-mode:
+   *
+   * Sets the handling method used for events received from send_event
+   * function. The default is %MODE_DEFAULT, that uses %GstBin's default
+   * handling (push the event to all internal sinks).
+   *
+   * Since: 0.10.37
+   */
+  g_object_class_install_property (gobject_klass, PROP_SEND_EVENT_MODE,
+      g_param_spec_enum ("send-event-mode", "Send event mode",
+          "How to send events received in send_event function",
+          GST_TYPE_PLAY_SINK_SEND_EVENT_MODE, MODE_DEFAULT,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /**
+   * GstPlaySink::force-aspect-ratio:
+   *
+   * Requests the video sink to enforce the video display aspect ratio.
+   *
+   * Since: 0.10.37
+   */
+  g_object_class_install_property (gobject_klass, PROP_FORCE_ASPECT_RATIO,
+      g_param_spec_boolean ("force-aspect-ratio", "Force Aspect Ratio",
+          "When enabled, scaling will respect original aspect ratio", TRUE,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
   g_signal_new ("reconfigure", G_TYPE_FROM_CLASS (klass),
       G_SIGNAL_RUN_LAST | G_SIGNAL_ACTION, G_STRUCT_OFFSET (GstPlaySinkClass,
           reconfigure), NULL, NULL, gst_marshal_BOOLEAN__VOID, G_TYPE_BOOLEAN,
@@ -409,16 +640,13 @@ gst_play_sink_class_init (GstPlaySinkClass * klass)
       G_STRUCT_OFFSET (GstPlaySinkClass, convert_frame), NULL, NULL,
       gst_play_marshal_BUFFER__BOXED, GST_TYPE_BUFFER, 1, GST_TYPE_CAPS);
 
-  gst_element_class_add_pad_template (gstelement_klass,
-      gst_static_pad_template_get (&audiorawtemplate));
-  gst_element_class_add_pad_template (gstelement_klass,
-      gst_static_pad_template_get (&audiotemplate));
-  gst_element_class_add_pad_template (gstelement_klass,
-      gst_static_pad_template_get (&videorawtemplate));
-  gst_element_class_add_pad_template (gstelement_klass,
-      gst_static_pad_template_get (&videotemplate));
-  gst_element_class_add_pad_template (gstelement_klass,
-      gst_static_pad_template_get (&texttemplate));
+  gst_element_class_add_static_pad_template (gstelement_klass,
+      &audiorawtemplate);
+  gst_element_class_add_static_pad_template (gstelement_klass, &audiotemplate);
+  gst_element_class_add_static_pad_template (gstelement_klass,
+      &videorawtemplate);
+  gst_element_class_add_static_pad_template (gstelement_klass, &videotemplate);
+  gst_element_class_add_static_pad_template (gstelement_klass, &texttemplate);
   gst_element_class_set_details_simple (gstelement_klass, "Player Sink",
       "Generic/Bin/Sink",
       "Convenience sink for multiple streams",
@@ -437,11 +665,19 @@ gst_play_sink_class_init (GstPlaySinkClass * klass)
 
   klass->reconfigure = GST_DEBUG_FUNCPTR (gst_play_sink_reconfigure);
   klass->convert_frame = GST_DEBUG_FUNCPTR (gst_play_sink_convert_frame);
+
+  _playsink_reset_segment_event_marker_id =
+      g_quark_from_static_string ("gst-playsink-reset-segment-event-marker");
+
+  g_type_class_ref (GST_TYPE_STREAM_SYNCHRONIZER);
+  g_type_class_ref (GST_TYPE_COLOR_BALANCE_CHANNEL);
 }
 
 static void
 gst_play_sink_init (GstPlaySink * playsink)
 {
+  GstColorBalanceChannel *channel;
+
   /* init groups */
   playsink->video_sink = NULL;
   playsink->audio_sink = NULL;
@@ -451,6 +687,8 @@ gst_play_sink_init (GstPlaySink * playsink)
   playsink->font_desc = NULL;
   playsink->subtitle_encoding = NULL;
   playsink->flags = DEFAULT_FLAGS;
+  playsink->send_event_mode = MODE_DEFAULT;
+  playsink->force_aspect_ratio = TRUE;
 
   playsink->stream_synchronizer =
       g_object_new (GST_TYPE_STREAM_SYNCHRONIZER, NULL);
@@ -459,6 +697,46 @@ gst_play_sink_init (GstPlaySink * playsink)
 
   g_static_rec_mutex_init (&playsink->lock);
   GST_OBJECT_FLAG_SET (playsink, GST_ELEMENT_IS_SINK);
+
+  channel =
+      GST_COLOR_BALANCE_CHANNEL (g_object_new (GST_TYPE_COLOR_BALANCE_CHANNEL,
+          NULL));
+  channel->label = g_strdup ("CONTRAST");
+  channel->min_value = -1000;
+  channel->max_value = 1000;
+  playsink->colorbalance_channels =
+      g_list_append (playsink->colorbalance_channels, channel);
+  playsink->colorbalance_values[0] = 0;
+
+  channel =
+      GST_COLOR_BALANCE_CHANNEL (g_object_new (GST_TYPE_COLOR_BALANCE_CHANNEL,
+          NULL));
+  channel->label = g_strdup ("BRIGHTNESS");
+  channel->min_value = -1000;
+  channel->max_value = 1000;
+  playsink->colorbalance_channels =
+      g_list_append (playsink->colorbalance_channels, channel);
+  playsink->colorbalance_values[1] = 0;
+
+  channel =
+      GST_COLOR_BALANCE_CHANNEL (g_object_new (GST_TYPE_COLOR_BALANCE_CHANNEL,
+          NULL));
+  channel->label = g_strdup ("HUE");
+  channel->min_value = -1000;
+  channel->max_value = 1000;
+  playsink->colorbalance_channels =
+      g_list_append (playsink->colorbalance_channels, channel);
+  playsink->colorbalance_values[2] = 0;
+
+  channel =
+      GST_COLOR_BALANCE_CHANNEL (g_object_new (GST_TYPE_COLOR_BALANCE_CHANNEL,
+          NULL));
+  channel->label = g_strdup ("SATURATION");
+  channel->min_value = -1000;
+  channel->max_value = 1000;
+  playsink->colorbalance_channels =
+      g_list_append (playsink->colorbalance_channels, channel);
+  playsink->colorbalance_values[3] = 0;
 }
 
 static void
@@ -550,6 +828,11 @@ gst_play_sink_dispose (GObject * object)
 
   playsink->stream_synchronizer = NULL;
 
+  g_list_foreach (playsink->colorbalance_channels, (GFunc) gst_object_unref,
+      NULL);
+  g_list_free (playsink->colorbalance_channels);
+  playsink->colorbalance_channels = NULL;
+
   G_OBJECT_CLASS (gst_play_sink_parent_class)->dispose (object);
 }
 
@@ -613,6 +896,7 @@ gst_play_sink_get_sink (GstPlaySink * playsink, GstPlaySinkType type)
   GST_PLAY_SINK_LOCK (playsink);
   switch (type) {
     case GST_PLAY_SINK_TYPE_AUDIO:
+    case GST_PLAY_SINK_TYPE_AUDIO_RAW:
     {
       GstPlayAudioChain *chain;
       if ((chain = (GstPlayAudioChain *) playsink->audiochain))
@@ -621,6 +905,7 @@ gst_play_sink_get_sink (GstPlaySink * playsink, GstPlaySinkType type)
       break;
     }
     case GST_PLAY_SINK_TYPE_VIDEO:
+    case GST_PLAY_SINK_TYPE_VIDEO_RAW:
     {
       GstPlayVideoChain *chain;
       if ((chain = (GstPlayVideoChain *) playsink->videochain))
@@ -1077,7 +1362,7 @@ try_element (GstPlaySink * playsink, GstElement * element, gboolean unref)
 }
 
 /* make the element (bin) that contains the elements needed to perform
- * video display.
+ * video display. Only used for *raw* video streams.
  *
  *  +------------------------------------------------------------+
  *  | vbin                                                       |
@@ -1108,13 +1393,13 @@ gen_video_deinterlace_chain (GstPlaySink * playsink)
   bin = GST_BIN_CAST (chain->chain.bin);
   gst_object_ref_sink (bin);
 
-  GST_DEBUG_OBJECT (playsink, "creating ffmpegcolorspace");
-  chain->conv = gst_element_factory_make ("ffmpegcolorspace", "vdconv");
+  GST_DEBUG_OBJECT (playsink, "creating " COLORSPACE);
+  chain->conv = gst_element_factory_make (COLORSPACE, "vdconv");
   if (chain->conv == NULL) {
-    post_missing_element_message (playsink, "ffmpegcolorspace");
+    post_missing_element_message (playsink, COLORSPACE);
     GST_ELEMENT_WARNING (playsink, CORE, MISSING_PLUGIN,
         (_("Missing element '%s' - check your GStreamer installation."),
-            "ffmpegcolorspace"), ("video rendering might fail"));
+            COLORSPACE), ("video rendering might fail"));
   } else {
     gst_bin_add (bin, chain->conv);
     head = chain->conv;
@@ -1168,6 +1453,152 @@ link_failed:
     free_chain ((GstPlayChain *) chain);
     return NULL;
   }
+}
+
+static gboolean
+is_valid_color_balance_element (GstElement * element)
+{
+  GstColorBalance *bal = GST_COLOR_BALANCE (element);
+  gboolean have_brightness = FALSE;
+  gboolean have_contrast = FALSE;
+  gboolean have_hue = FALSE;
+  gboolean have_saturation = FALSE;
+  const GList *channels, *l;
+
+  channels = gst_color_balance_list_channels (bal);
+  for (l = channels; l; l = l->next) {
+    GstColorBalanceChannel *ch = l->data;
+
+    if (g_strrstr (ch->label, "BRIGHTNESS"))
+      have_brightness = TRUE;
+    else if (g_strrstr (ch->label, "CONTRAST"))
+      have_contrast = TRUE;
+    else if (g_strrstr (ch->label, "HUE"))
+      have_hue = TRUE;
+    else if (g_strrstr (ch->label, "SATURATION"))
+      have_saturation = TRUE;
+  }
+
+  return have_brightness && have_contrast && have_hue && have_saturation;
+}
+
+static void
+iterate_color_balance_elements (gpointer data, gpointer user_data)
+{
+  gboolean valid = is_valid_color_balance_element (data);
+  GstColorBalance **cb_out = user_data;
+
+  if (valid) {
+    if (*cb_out
+        && gst_color_balance_get_balance_type (*cb_out) ==
+        GST_COLOR_BALANCE_SOFTWARE) {
+      gst_object_unref (*cb_out);
+      *cb_out = GST_COLOR_BALANCE (gst_object_ref (data));
+    } else if (!*cb_out) {
+      *cb_out = GST_COLOR_BALANCE (gst_object_ref (data));
+    }
+  }
+
+  gst_object_unref (data);
+}
+
+static GstColorBalance *
+find_color_balance_element (GstElement * element)
+{
+  GstIterator *it;
+  GstColorBalance *cb = NULL;
+
+  if (GST_IS_COLOR_BALANCE (element)
+      && is_valid_color_balance_element (element))
+    return GST_COLOR_BALANCE (gst_object_ref (element));
+  else if (!GST_IS_BIN (element))
+    return FALSE;
+
+  it = gst_bin_iterate_all_by_interface (GST_BIN (element),
+      GST_TYPE_COLOR_BALANCE);
+  while (gst_iterator_foreach (it, iterate_color_balance_elements,
+          &cb) == GST_ITERATOR_RESYNC)
+    gst_iterator_resync (it);
+  gst_iterator_free (it);
+
+  return cb;
+}
+
+static void
+colorbalance_value_changed_cb (GstColorBalance * balance,
+    GstColorBalanceChannel * channel, gint value, GstPlaySink * playsink)
+{
+  GList *l;
+  gint i;
+
+  for (i = 0, l = playsink->colorbalance_channels; l; l = l->next, i++) {
+    GstColorBalanceChannel *proxy = l->data;
+
+    if (g_strrstr (channel->label, proxy->label)) {
+      gdouble new_val;
+
+      /* Convert to [0, 1] range */
+      new_val =
+          ((gdouble) value -
+          (gdouble) channel->min_value) / ((gdouble) channel->max_value -
+          (gdouble) channel->min_value);
+      /* Convert to proxy range */
+      new_val =
+          proxy->min_value + new_val * ((gdouble) proxy->max_value -
+          (gdouble) proxy->min_value);
+      playsink->colorbalance_values[i] = (gint) (0.5 + new_val);
+
+      gst_color_balance_value_changed (GST_COLOR_BALANCE (playsink), proxy,
+          playsink->colorbalance_values[i]);
+      break;
+    }
+  }
+}
+
+static void
+update_colorbalance (GstPlaySink * playsink)
+{
+  GstColorBalance *balance = NULL;
+  GList *l;
+  gint i;
+
+  GST_OBJECT_LOCK (playsink);
+  if (playsink->colorbalance_element) {
+    balance =
+        GST_COLOR_BALANCE (gst_object_ref (playsink->colorbalance_element));
+  }
+  GST_OBJECT_UNLOCK (playsink);
+  if (!balance)
+    return;
+
+  g_signal_handlers_block_by_func (balance,
+      G_CALLBACK (colorbalance_value_changed_cb), playsink);
+
+  for (i = 0, l = playsink->colorbalance_channels; l; l = l->next, i++) {
+    GstColorBalanceChannel *proxy = l->data;
+    GstColorBalanceChannel *channel = NULL;
+    const GList *channels, *k;
+
+    channels = gst_color_balance_list_channels (balance);
+    for (k = channels; k; k = k->next) {
+      GstColorBalanceChannel *tmp = k->data;
+
+      if (g_strrstr (tmp->label, proxy->label)) {
+        channel = tmp;
+        break;
+      }
+    }
+
+    g_assert (channel);
+
+    gst_color_balance_set_value (balance, channel,
+        playsink->colorbalance_values[i]);
+  }
+
+  g_signal_handlers_unblock_by_func (balance,
+      G_CALLBACK (colorbalance_value_changed_cb), playsink);
+
+  gst_object_unref (balance);
 }
 
 /* make the element (bin) that contains the elements needed to perform
@@ -1237,10 +1668,18 @@ gen_video_chain (GstPlaySink * playsink, gboolean raw, gboolean async)
     chain->async = TRUE;
   }
 
+  /* Make sure the aspect ratio is kept */
+  elem =
+      gst_play_sink_find_property_sinks (playsink, chain->sink,
+      "force-aspect-ratio", G_TYPE_BOOLEAN);
+  if (elem)
+    g_object_set (elem, "force-aspect-ratio", playsink->force_aspect_ratio,
+        NULL);
+
   /* find ts-offset element */
-  chain->ts_offset =
+  gst_object_replace ((GstObject **) & chain->ts_offset, (GstObject *)
       gst_play_sink_find_property_sinks (playsink, chain->sink, "ts-offset",
-      G_TYPE_INT64);
+          G_TYPE_INT64));
 
   /* create a bin to hold objects, as we create them we add them to this bin so
    * that when something goes wrong we only need to unref the bin */
@@ -1248,6 +1687,34 @@ gen_video_chain (GstPlaySink * playsink, gboolean raw, gboolean async)
   bin = GST_BIN_CAST (chain->chain.bin);
   gst_object_ref_sink (bin);
   gst_bin_add (bin, chain->sink);
+
+  /* Get the XOverlay element */
+  {
+    GstXOverlay *xoverlay = NULL;
+
+    GST_OBJECT_LOCK (playsink);
+    if (playsink->xoverlay_element)
+      gst_object_unref (playsink->xoverlay_element);
+    playsink->xoverlay_element =
+        GST_X_OVERLAY (gst_bin_get_by_interface (GST_BIN (chain->chain.bin),
+            GST_TYPE_X_OVERLAY));
+    if (playsink->xoverlay_element)
+      xoverlay = GST_X_OVERLAY (gst_object_ref (playsink->xoverlay_element));
+    GST_OBJECT_UNLOCK (playsink);
+
+    if (xoverlay) {
+      if (playsink->xoverlay_handle_set)
+        gst_x_overlay_set_window_handle (xoverlay, playsink->xoverlay_handle);
+      if (playsink->xoverlay_handle_events_set)
+        gst_x_overlay_handle_events (xoverlay,
+            playsink->xoverlay_handle_events);
+      if (playsink->xoverlay_render_rectangle_set)
+        gst_x_overlay_set_render_rectangle (xoverlay,
+            playsink->xoverlay_x, playsink->xoverlay_y,
+            playsink->xoverlay_width, playsink->xoverlay_height);
+      gst_object_unref (xoverlay);
+    }
+  }
 
   /* decouple decoder from sink, this improves playback quite a lot since the
    * decoder can continue while the sink blocks for synchronisation. We don't
@@ -1268,47 +1735,50 @@ gen_video_chain (GstPlaySink * playsink, gboolean raw, gboolean async)
     head = prev = chain->queue;
   }
 
-  if (raw && !(playsink->flags & GST_PLAY_FLAG_NATIVE_VIDEO)) {
-    GST_DEBUG_OBJECT (playsink, "creating ffmpegcolorspace");
-    chain->conv = gst_element_factory_make ("ffmpegcolorspace", "vconv");
-    if (chain->conv == NULL) {
-      post_missing_element_message (playsink, "ffmpegcolorspace");
-      GST_ELEMENT_WARNING (playsink, CORE, MISSING_PLUGIN,
-          (_("Missing element '%s' - check your GStreamer installation."),
-              "ffmpegcolorspace"), ("video rendering might fail"));
-    } else {
-      gst_bin_add (bin, chain->conv);
-      if (prev) {
-        if (!gst_element_link_pads_full (prev, "src", chain->conv, "sink",
-                GST_PAD_LINK_CHECK_TEMPLATE_CAPS))
-          goto link_failed;
-      } else {
-        head = chain->conv;
-      }
-      prev = chain->conv;
-    }
-
-    GST_DEBUG_OBJECT (playsink, "creating videoscale");
-    chain->scale = gst_element_factory_make ("videoscale", "vscale");
-    if (chain->scale == NULL) {
-      post_missing_element_message (playsink, "videoscale");
-      GST_ELEMENT_WARNING (playsink, CORE, MISSING_PLUGIN,
-          (_("Missing element '%s' - check your GStreamer installation."),
-              "videoscale"), ("possibly a liboil version mismatch?"));
-    } else {
-      /* Add black borders if necessary to keep the DAR */
-      g_object_set (chain->scale, "add-borders", TRUE, NULL);
-      gst_bin_add (bin, chain->scale);
-      if (prev) {
-        if (!gst_element_link_pads_full (prev, "src", chain->scale, "sink",
-                GST_PAD_LINK_CHECK_TEMPLATE_CAPS))
-          goto link_failed;
-      } else {
-        head = chain->scale;
-      }
-      prev = chain->scale;
-    }
+  GST_OBJECT_LOCK (playsink);
+  if (playsink->colorbalance_element) {
+    g_signal_handlers_disconnect_by_func (playsink->colorbalance_element,
+        G_CALLBACK (colorbalance_value_changed_cb), playsink);
+    gst_object_unref (playsink->colorbalance_element);
   }
+  playsink->colorbalance_element = find_color_balance_element (chain->sink);
+  if (playsink->colorbalance_element) {
+    g_signal_connect (playsink->colorbalance_element, "value-changed",
+        G_CALLBACK (colorbalance_value_changed_cb), playsink);
+  }
+  GST_OBJECT_UNLOCK (playsink);
+
+  if (!(playsink->flags & GST_PLAY_FLAG_NATIVE_VIDEO)
+      || (!playsink->colorbalance_element
+          && (playsink->flags & GST_PLAY_FLAG_SOFT_COLORBALANCE))) {
+    gboolean use_converters = !(playsink->flags & GST_PLAY_FLAG_NATIVE_VIDEO);
+    gboolean use_balance = !playsink->colorbalance_element
+        && (playsink->flags & GST_PLAY_FLAG_SOFT_COLORBALANCE);
+
+    GST_DEBUG_OBJECT (playsink, "creating videoconverter");
+    chain->conv =
+        g_object_new (GST_TYPE_PLAY_SINK_VIDEO_CONVERT, "name", "vconv",
+        "use-converters", use_converters, "use-balance", use_balance, NULL);
+
+    GST_OBJECT_LOCK (playsink);
+    if (use_balance && GST_PLAY_SINK_VIDEO_CONVERT (chain->conv)->balance)
+      playsink->colorbalance_element =
+          GST_COLOR_BALANCE (gst_object_ref (GST_PLAY_SINK_VIDEO_CONVERT
+              (chain->conv)->balance));
+    GST_OBJECT_UNLOCK (playsink);
+
+    gst_bin_add (bin, chain->conv);
+    if (prev) {
+      if (!gst_element_link_pads_full (prev, "src", chain->conv, "sink",
+              GST_PAD_LINK_CHECK_TEMPLATE_CAPS))
+        goto link_failed;
+    } else {
+      head = chain->conv;
+    }
+    prev = chain->conv;
+  }
+
+  update_colorbalance (playsink);
 
   if (prev) {
     GST_DEBUG_OBJECT (playsink, "linking to sink");
@@ -1319,8 +1789,17 @@ gen_video_chain (GstPlaySink * playsink, gboolean raw, gboolean async)
 
   pad = gst_element_get_static_pad (head, "sink");
   chain->sinkpad = gst_ghost_pad_new ("sink", pad);
-  gst_object_unref (pad);
 
+  /* sending audio/video flushes break stream changes when the pipeline
+   * is paused and played again in 0.10 */
+#if 0
+  gst_pad_set_event_function (chain->sinkpad,
+      GST_DEBUG_FUNCPTR (gst_play_sink_video_sink_event));
+  gst_pad_set_chain_function (chain->sinkpad,
+      GST_DEBUG_FUNCPTR (gst_play_sink_video_sink_chain));
+#endif
+
+  gst_object_unref (pad);
   gst_element_add_pad (chain->chain.bin, chain->sinkpad);
 
   return chain;
@@ -1356,6 +1835,7 @@ no_sinks:
     free_chain ((GstPlayChain *) chain);
     return NULL;
   }
+
 link_failed:
   {
     GST_ELEMENT_ERROR (playsink, CORE, PAD,
@@ -1378,22 +1858,49 @@ setup_video_chain (GstPlaySink * playsink, gboolean raw, gboolean async)
 
   chain = playsink->videochain;
 
+  chain->chain.raw = raw;
+
   /* if the chain was active we don't do anything */
   if (GST_PLAY_CHAIN (chain)->activated == TRUE)
     return TRUE;
-
-  if (chain->chain.raw != raw)
-    return FALSE;
 
   /* try to set the sink element to READY again */
   ret = gst_element_set_state (chain->sink, GST_STATE_READY);
   if (ret == GST_STATE_CHANGE_FAILURE)
     return FALSE;
 
+  /* Get the XOverlay element */
+  {
+    GstXOverlay *xoverlay = NULL;
+
+    GST_OBJECT_LOCK (playsink);
+    if (playsink->xoverlay_element)
+      gst_object_unref (playsink->xoverlay_element);
+    playsink->xoverlay_element =
+        GST_X_OVERLAY (gst_bin_get_by_interface (GST_BIN (chain->chain.bin),
+            GST_TYPE_X_OVERLAY));
+    if (playsink->xoverlay_element)
+      xoverlay = GST_X_OVERLAY (gst_object_ref (playsink->xoverlay_element));
+    GST_OBJECT_UNLOCK (playsink);
+
+    if (xoverlay) {
+      if (playsink->xoverlay_handle_set)
+        gst_x_overlay_set_window_handle (xoverlay, playsink->xoverlay_handle);
+      if (playsink->xoverlay_handle_events_set)
+        gst_x_overlay_handle_events (xoverlay,
+            playsink->xoverlay_handle_events);
+      if (playsink->xoverlay_render_rectangle_set)
+        gst_x_overlay_set_render_rectangle (xoverlay,
+            playsink->xoverlay_x, playsink->xoverlay_y,
+            playsink->xoverlay_width, playsink->xoverlay_height);
+      gst_object_unref (xoverlay);
+    }
+  }
+
   /* find ts-offset element */
-  chain->ts_offset =
+  gst_object_replace ((GstObject **) & chain->ts_offset, (GstObject *)
       gst_play_sink_find_property_sinks (playsink, chain->sink, "ts-offset",
-      G_TYPE_INT64);
+          G_TYPE_INT64));
 
   /* if we can disable async behaviour of the sink, we can avoid adding a
    * queue for the audio chain. */
@@ -1409,10 +1916,386 @@ setup_video_chain (GstPlaySink * playsink, gboolean raw, gboolean async)
     GST_DEBUG_OBJECT (playsink, "no async property on the sink");
     chain->async = TRUE;
   }
+
+  /* Make sure the aspect ratio is kept */
+  elem =
+      gst_play_sink_find_property_sinks (playsink, chain->sink,
+      "force-aspect-ratio", G_TYPE_BOOLEAN);
+  if (elem)
+    g_object_set (elem, "force-aspect-ratio", playsink->force_aspect_ratio,
+        NULL);
+
+  GST_OBJECT_LOCK (playsink);
+  if (playsink->colorbalance_element) {
+    g_signal_handlers_disconnect_by_func (playsink->colorbalance_element,
+        G_CALLBACK (colorbalance_value_changed_cb), playsink);
+    gst_object_unref (playsink->colorbalance_element);
+  }
+  playsink->colorbalance_element = find_color_balance_element (chain->sink);
+  if (playsink->colorbalance_element) {
+    g_signal_connect (playsink->colorbalance_element, "value-changed",
+        G_CALLBACK (colorbalance_value_changed_cb), playsink);
+  }
+  GST_OBJECT_UNLOCK (playsink);
+
+  if (chain->conv) {
+    gboolean use_balance = !playsink->colorbalance_element
+        && (playsink->flags & GST_PLAY_FLAG_SOFT_COLORBALANCE);
+
+    g_object_set (chain->conv, "use-balance", use_balance, NULL);
+
+    GST_OBJECT_LOCK (playsink);
+    if (use_balance && GST_PLAY_SINK_VIDEO_CONVERT (chain->conv)->balance)
+      playsink->colorbalance_element =
+          GST_COLOR_BALANCE (gst_object_ref (GST_PLAY_SINK_VIDEO_CONVERT
+              (chain->conv)->balance));
+    GST_OBJECT_UNLOCK (playsink);
+  }
+
+  update_colorbalance (playsink);
+
   return TRUE;
 }
 
+static void
+gst_play_sink_generate_update_newsegment_event (GstPad * pad,
+    GstSegment * segment, GstEvent ** event1, GstEvent ** event2)
+{
+  GstEvent *event;
+
+  *event1 = NULL;
+  *event2 = NULL;
+
+  event = gst_event_new_new_segment_full (FALSE, segment->rate,
+      segment->applied_rate, segment->format, 0, GST_CLOCK_TIME_NONE, 0);
+  gst_structure_id_set (event->structure,
+      _playsink_reset_segment_event_marker_id, G_TYPE_BOOLEAN, TRUE, NULL);
+  *event1 = event;
+
+  event = gst_event_new_new_segment_full (FALSE, segment->rate,
+      segment->applied_rate, segment->format,
+      segment->start, segment->stop, segment->time);
+  gst_structure_id_set (event->structure,
+      _playsink_reset_segment_event_marker_id, G_TYPE_BOOLEAN, TRUE, NULL);
+  *event2 = event;
+}
+
+static gboolean
+gst_play_sink_sink_event (GstPad * pad, GstEvent * event,
+    const gchar * sink_type,
+    gboolean * sink_ignore_wrong_state,
+    gboolean * sink_custom_flush_finished,
+    gboolean * sink_pending_flush, GstSegment * sink_segment)
+{
+  GstBin *tbin = GST_BIN_CAST (gst_pad_get_parent (pad));
+  GstPlaySink *playsink = GST_PLAY_SINK_CAST (gst_pad_get_parent (tbin));
+  gboolean ret;
+
+  if (GST_EVENT_TYPE (event) == GST_EVENT_CUSTOM_DOWNSTREAM_OOB &&
+      event->structure) {
+    gchar *custom_flush;
+    gchar *custom_flush_finish;
+
+    custom_flush = g_strdup_printf ("playsink-custom-%s-flush", sink_type);
+    custom_flush_finish =
+        g_strdup_printf ("playsink-custom-%s-flush-finish", sink_type);
+    if (strcmp (gst_structure_get_name (event->structure), custom_flush) == 0) {
+      GST_DEBUG_OBJECT (pad,
+          "Custom %s flush event received, marking to flush %s", sink_type,
+          sink_type);
+      GST_PLAY_SINK_LOCK (playsink);
+      *sink_ignore_wrong_state = TRUE;
+      *sink_custom_flush_finished = FALSE;
+      GST_PLAY_SINK_UNLOCK (playsink);
+    } else if (strcmp (gst_structure_get_name (event->structure),
+            custom_flush_finish) == 0) {
+      GST_DEBUG_OBJECT (pad, "Custom %s flush finish event received",
+          sink_type);
+      GST_PLAY_SINK_LOCK (playsink);
+      *sink_pending_flush = TRUE;
+      *sink_custom_flush_finished = TRUE;
+      GST_PLAY_SINK_UNLOCK (playsink);
+    }
+
+    g_free (custom_flush);
+    g_free (custom_flush_finish);
+  } else if (GST_EVENT_TYPE (event) == GST_EVENT_FLUSH_STOP) {
+    GST_PLAY_SINK_LOCK (playsink);
+    GST_DEBUG_OBJECT (pad, "Resetting %s segment because of flush-stop event",
+        sink_type);
+    gst_segment_init (sink_segment, GST_FORMAT_UNDEFINED);
+    GST_PLAY_SINK_UNLOCK (playsink);
+  }
+
+  GST_DEBUG_OBJECT (pad, "Forwarding event %" GST_PTR_FORMAT, event);
+  ret = gst_proxy_pad_event_default (pad, gst_event_ref (event));
+
+  if (GST_EVENT_TYPE (event) == GST_EVENT_NEWSEGMENT) {
+    gboolean update;
+    gdouble rate, applied_rate;
+    GstFormat format;
+    gint64 start, stop, position;
+
+    GST_DEBUG_OBJECT (pad, "Newsegment event: %" GST_PTR_FORMAT,
+        event->structure);
+    gst_event_parse_new_segment_full (event, &update, &rate, &applied_rate,
+        &format, &start, &stop, &position);
+
+    GST_PLAY_SINK_LOCK (playsink);
+    if (sink_segment->format != format) {
+      GST_DEBUG_OBJECT (pad, "%s segment format changed: %s -> %s",
+          sink_type,
+          gst_format_get_name (sink_segment->format),
+          gst_format_get_name (format));
+      gst_segment_init (sink_segment, format);
+    }
+
+    GST_DEBUG_OBJECT (pad, "Old %s segment: %" GST_SEGMENT_FORMAT,
+        sink_type, sink_segment);
+    gst_segment_set_newsegment_full (sink_segment, update, rate,
+        applied_rate, format, start, stop, position);
+    GST_DEBUG_OBJECT (pad, "New %s segment: %" GST_SEGMENT_FORMAT,
+        sink_type, sink_segment);
+    GST_PLAY_SINK_UNLOCK (playsink);
+  }
+
+  gst_event_unref (event);
+  gst_object_unref (playsink);
+  gst_object_unref (tbin);
+  return ret;
+}
+
+static GstFlowReturn
+gst_play_sink_sink_chain (GstPad * pad, GstBuffer * buffer,
+    const gchar * sink_type,
+    gboolean * sink_ignore_wrong_state,
+    gboolean * sink_custom_flush_finished,
+    gboolean * sink_pending_flush, GstSegment * sink_segment)
+{
+  GstBin *tbin = GST_BIN_CAST (gst_pad_get_parent (pad));
+  GstPlaySink *playsink = GST_PLAY_SINK_CAST (gst_pad_get_parent (tbin));
+  GstFlowReturn ret;
+
+  GST_PLAY_SINK_LOCK (playsink);
+
+  if (*sink_pending_flush) {
+    GstSegment segment_copy;
+    GstEvent *event;
+
+    *sink_pending_flush = FALSE;
+
+    /* sink_segment will be updated in flush */
+    segment_copy = *sink_segment;
+
+    GST_PLAY_SINK_UNLOCK (playsink);
+
+    /* make the bin drop all cached data.
+     * This event will be dropped on the src pad, if any. */
+    event = gst_event_new_flush_start ();
+    if (!event->structure) {
+      event->structure =
+          gst_structure_id_empty_new (_playsink_reset_segment_event_marker_id);
+      gst_structure_set_parent_refcount (event->structure,
+          &event->mini_object.refcount);
+    }
+    gst_structure_id_set (event->structure,
+        _playsink_reset_segment_event_marker_id, G_TYPE_BOOLEAN, TRUE, NULL);
+
+    GST_DEBUG_OBJECT (pad,
+        "Pushing %s flush-start event with reset segment marker set: %"
+        GST_PTR_FORMAT, sink_type, event);
+    gst_pad_send_event (pad, event);
+
+    event = gst_event_new_flush_stop ();
+    if (!event->structure) {
+      event->structure =
+          gst_structure_id_empty_new (_playsink_reset_segment_event_marker_id);
+      gst_structure_set_parent_refcount (event->structure,
+          &event->mini_object.refcount);
+    }
+    gst_structure_id_set (event->structure,
+        _playsink_reset_segment_event_marker_id, G_TYPE_BOOLEAN, TRUE, NULL);
+
+    GST_DEBUG_OBJECT (pad,
+        "Pushing %s flush-stop event with reset segment marker set: %"
+        GST_PTR_FORMAT, sink_type, event);
+    gst_pad_send_event (pad, event);
+
+    /* Re-sync queue segment info after flush.
+     * This event will be dropped on the src pad, if any. */
+    if (segment_copy.format != GST_FORMAT_UNDEFINED) {
+      GstEvent *event1, *event2;
+
+      gst_play_sink_generate_update_newsegment_event (pad, &segment_copy,
+          &event1, &event2);
+      GST_DEBUG_OBJECT (playsink,
+          "Pushing %s accumulate newsegment event with reset "
+          "segment marker set: %" GST_PTR_FORMAT, sink_type, event1->structure);
+      GST_DEBUG_OBJECT (playsink,
+          "Pushing %s update newsegment event with reset "
+          "segment marker set: %" GST_PTR_FORMAT, sink_type, event2->structure);
+      gst_pad_send_event (pad, event1);
+      gst_pad_send_event (pad, event2);
+    }
+  } else {
+    GST_PLAY_SINK_UNLOCK (playsink);
+  }
+
+  ret = gst_proxy_pad_chain_default (pad, buffer);
+
+  GST_PLAY_SINK_LOCK (playsink);
+  if (ret == GST_FLOW_WRONG_STATE && *sink_ignore_wrong_state) {
+    GST_DEBUG_OBJECT (pad, "Ignoring wrong state for %s during flush",
+        sink_type);
+    if (*sink_custom_flush_finished) {
+      GST_DEBUG_OBJECT (pad, "Custom flush finished, stop ignoring "
+          "wrong state for %s", sink_type);
+      *sink_ignore_wrong_state = FALSE;
+    }
+
+    ret = GST_FLOW_OK;
+  }
+  GST_PLAY_SINK_UNLOCK (playsink);
+
+  gst_object_unref (playsink);
+  gst_object_unref (tbin);
+  return ret;
+}
+
+/* sending audio/video flushes break stream changes when the pipeline
+ * is paused and played again in 0.10 */
+#if 0
+static gboolean
+gst_play_sink_video_sink_event (GstPad * pad, GstEvent * event)
+{
+  GstBin *tbin = GST_BIN_CAST (gst_pad_get_parent (pad));
+  GstPlaySink *playsink = GST_PLAY_SINK_CAST (gst_pad_get_parent (tbin));
+  gboolean ret;
+
+  ret = gst_play_sink_sink_event (pad, event, "video",
+      &playsink->video_ignore_wrong_state,
+      &playsink->video_custom_flush_finished,
+      &playsink->video_pending_flush, &playsink->video_segment);
+
+  gst_object_unref (playsink);
+  gst_object_unref (tbin);
+  return ret;
+}
+
+static GstFlowReturn
+gst_play_sink_video_sink_chain (GstPad * pad, GstBuffer * buffer)
+{
+  GstBin *tbin = GST_BIN_CAST (gst_pad_get_parent (pad));
+  GstPlaySink *playsink = GST_PLAY_SINK_CAST (gst_pad_get_parent (tbin));
+  gboolean ret;
+
+  ret = gst_play_sink_sink_chain (pad, buffer, "video",
+      &playsink->video_ignore_wrong_state,
+      &playsink->video_custom_flush_finished,
+      &playsink->video_pending_flush, &playsink->video_segment);
+
+  gst_object_unref (playsink);
+  gst_object_unref (tbin);
+  return ret;
+}
+
+static gboolean
+gst_play_sink_audio_sink_event (GstPad * pad, GstEvent * event)
+{
+  GstBin *tbin = GST_BIN_CAST (gst_pad_get_parent (pad));
+  GstPlaySink *playsink = GST_PLAY_SINK_CAST (gst_pad_get_parent (tbin));
+  gboolean ret;
+
+  ret = gst_play_sink_sink_event (pad, event, "audio",
+      &playsink->audio_ignore_wrong_state,
+      &playsink->audio_custom_flush_finished,
+      &playsink->audio_pending_flush, &playsink->audio_segment);
+
+  gst_object_unref (playsink);
+  gst_object_unref (tbin);
+  return ret;
+}
+
+static GstFlowReturn
+gst_play_sink_audio_sink_chain (GstPad * pad, GstBuffer * buffer)
+{
+  GstBin *tbin = GST_BIN_CAST (gst_pad_get_parent (pad));
+  GstPlaySink *playsink = GST_PLAY_SINK_CAST (gst_pad_get_parent (tbin));
+  gboolean ret;
+
+  ret = gst_play_sink_sink_chain (pad, buffer, "audio",
+      &playsink->audio_ignore_wrong_state,
+      &playsink->audio_custom_flush_finished,
+      &playsink->audio_pending_flush, &playsink->audio_segment);
+
+  gst_object_unref (playsink);
+  gst_object_unref (tbin);
+  return ret;
+}
+#endif
+
+static gboolean
+gst_play_sink_text_sink_event (GstPad * pad, GstEvent * event)
+{
+  GstBin *tbin = GST_BIN_CAST (gst_pad_get_parent (pad));
+  GstPlaySink *playsink = GST_PLAY_SINK_CAST (gst_pad_get_parent (tbin));
+  gboolean ret;
+
+  ret = gst_play_sink_sink_event (pad, event, "subtitle",
+      &playsink->text_ignore_wrong_state,
+      &playsink->text_custom_flush_finished,
+      &playsink->text_pending_flush, &playsink->text_segment);
+
+  gst_object_unref (playsink);
+  gst_object_unref (tbin);
+  return ret;
+}
+
+static GstFlowReturn
+gst_play_sink_text_sink_chain (GstPad * pad, GstBuffer * buffer)
+{
+  GstBin *tbin = GST_BIN_CAST (gst_pad_get_parent (pad));
+  GstPlaySink *playsink = GST_PLAY_SINK_CAST (gst_pad_get_parent (tbin));
+  gboolean ret;
+
+  ret = gst_play_sink_sink_chain (pad, buffer, "subtitle",
+      &playsink->text_ignore_wrong_state,
+      &playsink->text_custom_flush_finished,
+      &playsink->text_pending_flush, &playsink->text_segment);
+
+  gst_object_unref (playsink);
+  gst_object_unref (tbin);
+  return ret;
+}
+
+static gboolean
+gst_play_sink_text_src_event (GstPad * pad, GstEvent * event)
+{
+  gboolean ret;
+
+  GST_DEBUG_OBJECT (pad, "Got event %" GST_PTR_FORMAT, event);
+
+  if (event->structure &&
+      gst_structure_id_has_field (event->structure,
+          _playsink_reset_segment_event_marker_id)) {
+    /* the events marked with a reset segment marker
+     * are sent internally to reset the queue and
+     * must be dropped here */
+    GST_DEBUG_OBJECT (pad, "Dropping event with reset "
+        "segment marker set: %" GST_PTR_FORMAT, event);
+    ret = TRUE;
+    goto out;
+  }
+
+  ret = gst_proxy_pad_event_default (pad, gst_event_ref (event));
+
+out:
+  gst_event_unref (event);
+  return ret;
+}
+
 /* make an element for playback of video with subtitles embedded.
+ * Only used for *raw* video streams.
  *
  *  +--------------------------------------------+
  *  | tbin                                       |
@@ -1467,7 +2350,7 @@ gen_text_chain (GstPlaySink * playsink)
                   "queue"), ("rendering might be suboptimal"));
         } else {
           g_object_set (G_OBJECT (chain->queue), "max-size-buffers", 3,
-              "max-size-bytes", 0, "max-size-time", (gint64) 0,
+              "max-size-bytes", 0, "max-size-time", (gint64) GST_SECOND,
               "silent", TRUE, NULL);
           gst_bin_add (bin, chain->queue);
         }
@@ -1486,7 +2369,7 @@ gen_text_chain (GstPlaySink * playsink)
           chain->queue = NULL;
         }
         /* try to set sync to true but it's no biggie when we can't */
-        if ((elem =
+        if (chain->sink && (elem =
                 gst_play_sink_find_property_sinks (playsink, chain->sink,
                     "sync", G_TYPE_BOOLEAN)))
           g_object_set (elem, "sync", TRUE, NULL);
@@ -1501,7 +2384,7 @@ gen_text_chain (GstPlaySink * playsink)
     if (textsinkpad == NULL) {
       GST_ELEMENT_WARNING (playsink, CORE, MISSING_PLUGIN,
           (_("Custom text sink element is not usable.")),
-          ("fallback to default textoverlay"));
+          ("fallback to default subtitleoverlay"));
     }
   }
 
@@ -1556,13 +2439,21 @@ gen_text_chain (GstPlaySink * playsink)
                   "queue"), ("rendering might be suboptimal"));
         } else {
           g_object_set (G_OBJECT (element), "max-size-buffers", 3,
-              "max-size-bytes", 0, "max-size-time", (gint64) 0,
+              "max-size-bytes", 0, "max-size-time", (gint64) GST_SECOND,
               "silent", TRUE, NULL);
           gst_bin_add (bin, element);
-          gst_element_link_pads_full (element, "src", chain->overlay,
-              "subtitle_sink", GST_PAD_LINK_CHECK_TEMPLATE_CAPS);
-          textsinkpad = gst_element_get_static_pad (element, "sink");
-          srcpad = gst_element_get_static_pad (chain->overlay, "src");
+          if (gst_element_link_pads_full (element, "src", chain->overlay,
+                  "subtitle_sink", GST_PAD_LINK_CHECK_TEMPLATE_CAPS)) {
+            textsinkpad = gst_element_get_static_pad (element, "sink");
+            srcpad = gst_element_get_static_pad (chain->overlay, "src");
+          } else {
+            gst_bin_remove (bin, chain->sink);
+            gst_bin_remove (bin, chain->overlay);
+            chain->sink = NULL;
+            chain->overlay = NULL;
+            gst_object_unref (videosinkpad);
+            videosinkpad = NULL;
+          }
         }
       }
     }
@@ -1596,11 +2487,21 @@ gen_text_chain (GstPlaySink * playsink)
   if (textsinkpad) {
     chain->textsinkpad = gst_ghost_pad_new ("text_sink", textsinkpad);
     gst_object_unref (textsinkpad);
+
+    gst_pad_set_event_function (chain->textsinkpad,
+        GST_DEBUG_FUNCPTR (gst_play_sink_text_sink_event));
+    gst_pad_set_chain_function (chain->textsinkpad,
+        GST_DEBUG_FUNCPTR (gst_play_sink_text_sink_chain));
+
     gst_element_add_pad (chain->chain.bin, chain->textsinkpad);
   }
   if (srcpad) {
     chain->srcpad = gst_ghost_pad_new ("src", srcpad);
     gst_object_unref (srcpad);
+
+    gst_pad_set_event_function (chain->srcpad,
+        GST_DEBUG_FUNCPTR (gst_play_sink_text_src_event));
+
     gst_element_add_pad (chain->chain.bin, chain->srcpad);
   }
 
@@ -1707,9 +2608,9 @@ gen_audio_chain (GstPlaySink * playsink, gboolean raw)
   }
 
   /* find ts-offset element */
-  chain->ts_offset =
+  gst_object_replace ((GstObject **) & chain->ts_offset, (GstObject *)
       gst_play_sink_find_property_sinks (playsink, chain->sink, "ts-offset",
-      G_TYPE_INT64);
+          G_TYPE_INT64));
 
   /* check if the sink, or something within the sink, has the volume property.
    * If it does we don't need to add a volume element.  */
@@ -1757,54 +2658,33 @@ gen_audio_chain (GstPlaySink * playsink, gboolean raw)
     chain->sink_volume = FALSE;
   }
 
-  if (raw && !(playsink->flags & GST_PLAY_FLAG_NATIVE_AUDIO)) {
-    GST_DEBUG_OBJECT (playsink, "creating audioconvert");
-    chain->conv = gst_element_factory_make ("audioconvert", "aconv");
-    if (chain->conv == NULL) {
-      post_missing_element_message (playsink, "audioconvert");
-      GST_ELEMENT_WARNING (playsink, CORE, MISSING_PLUGIN,
-          (_("Missing element '%s' - check your GStreamer installation."),
-              "audioconvert"), ("possibly a liboil version mismatch?"));
+  if (!(playsink->flags & GST_PLAY_FLAG_NATIVE_AUDIO) || (!have_volume
+          && (playsink->flags & GST_PLAY_FLAG_SOFT_VOLUME))) {
+    gboolean use_converters = !(playsink->flags & GST_PLAY_FLAG_NATIVE_AUDIO);
+    gboolean use_volume =
+        !have_volume && (playsink->flags & GST_PLAY_FLAG_SOFT_VOLUME);
+    GST_DEBUG_OBJECT (playsink,
+        "creating audioconvert with use-converters %d, use-volume %d",
+        use_converters, use_volume);
+    chain->conv =
+        g_object_new (GST_TYPE_PLAY_SINK_AUDIO_CONVERT, "name", "aconv",
+        "use-converters", use_converters, "use-volume", use_volume, NULL);
+    gst_bin_add (bin, chain->conv);
+    if (prev) {
+      if (!gst_element_link_pads_full (prev, "src", chain->conv, "sink",
+              GST_PAD_LINK_CHECK_TEMPLATE_CAPS))
+        goto link_failed;
     } else {
-      gst_bin_add (bin, chain->conv);
-      if (prev) {
-        if (!gst_element_link_pads_full (prev, "src", chain->conv, "sink",
-                GST_PAD_LINK_CHECK_TEMPLATE_CAPS))
-          goto link_failed;
-      } else {
-        head = chain->conv;
-      }
-      prev = chain->conv;
+      head = chain->conv;
     }
+    prev = chain->conv;
 
-    GST_DEBUG_OBJECT (playsink, "creating audioresample");
-    chain->resample = gst_element_factory_make ("audioresample", "aresample");
-    if (chain->resample == NULL) {
-      post_missing_element_message (playsink, "audioresample");
-      GST_ELEMENT_WARNING (playsink, CORE, MISSING_PLUGIN,
-          (_("Missing element '%s' - check your GStreamer installation."),
-              "audioresample"), ("possibly a liboil version mismatch?"));
-    } else {
-      gst_bin_add (bin, chain->resample);
-      if (prev) {
-        if (!gst_element_link_pads_full (prev, "src", chain->resample, "sink",
-                GST_PAD_LINK_CHECK_TEMPLATE_CAPS))
-          goto link_failed;
-      } else {
-        head = chain->resample;
-      }
-      prev = chain->resample;
-    }
+    if (!have_volume && (playsink->flags & GST_PLAY_FLAG_SOFT_VOLUME)) {
+      GstPlaySinkAudioConvert *conv =
+          GST_PLAY_SINK_AUDIO_CONVERT_CAST (chain->conv);
 
-    if (!have_volume && playsink->flags & GST_PLAY_FLAG_SOFT_VOLUME) {
-      GST_DEBUG_OBJECT (playsink, "creating volume");
-      chain->volume = gst_element_factory_make ("volume", "volume");
-      if (chain->volume == NULL) {
-        post_missing_element_message (playsink, "volume");
-        GST_ELEMENT_WARNING (playsink, CORE, MISSING_PLUGIN,
-            (_("Missing element '%s' - check your GStreamer installation."),
-                "volume"), ("possibly a liboil version mismatch?"));
-      } else {
+      if (conv->volume) {
+        chain->volume = conv->volume;
         have_volume = TRUE;
 
         g_signal_connect (chain->volume, "notify::volume",
@@ -1819,16 +2699,6 @@ gen_audio_chain (GstPlaySink * playsink, gboolean raw)
         g_object_set (G_OBJECT (chain->volume), "volume", playsink->volume,
             NULL);
         g_object_set (G_OBJECT (chain->mute), "mute", playsink->mute, NULL);
-        gst_bin_add (bin, chain->volume);
-
-        if (prev) {
-          if (!gst_element_link_pads_full (prev, "src", chain->volume, "sink",
-                  GST_PAD_LINK_CHECK_TEMPLATE_CAPS))
-            goto link_failed;
-        } else {
-          head = chain->volume;
-        }
-        prev = chain->volume;
       }
     }
   }
@@ -1852,6 +2722,16 @@ gen_audio_chain (GstPlaySink * playsink, gboolean raw)
   GST_DEBUG_OBJECT (playsink, "ghosting sink pad");
   pad = gst_element_get_static_pad (head, "sink");
   chain->sinkpad = gst_ghost_pad_new ("sink", pad);
+
+  /* sending audio/video flushes break stream changes when the pipeline
+   * is paused and played again in 0.10 */
+#if 0
+  gst_pad_set_event_function (chain->sinkpad,
+      GST_DEBUG_FUNCPTR (gst_play_sink_audio_sink_event));
+  gst_pad_set_chain_function (chain->sinkpad,
+      GST_DEBUG_FUNCPTR (gst_play_sink_audio_sink_chain));
+#endif
+
   gst_object_unref (pad);
   gst_element_add_pad (chain->chain.bin, chain->sinkpad);
 
@@ -1907,15 +2787,16 @@ setup_audio_chain (GstPlaySink * playsink, gboolean raw)
   GstElement *elem;
   GstPlayAudioChain *chain;
   GstStateChangeReturn ret;
+  GstPlaySinkAudioConvert *conv;
 
   chain = playsink->audiochain;
+  conv = GST_PLAY_SINK_AUDIO_CONVERT_CAST (chain->conv);
+
+  chain->chain.raw = raw;
 
   /* if the chain was active we don't do anything */
   if (GST_PLAY_CHAIN (chain)->activated == TRUE)
     return TRUE;
-
-  if (chain->chain.raw != raw)
-    return FALSE;
 
   /* try to set the sink element to READY again */
   ret = gst_element_set_state (chain->sink, GST_STATE_READY);
@@ -1923,9 +2804,9 @@ setup_audio_chain (GstPlaySink * playsink, gboolean raw)
     return FALSE;
 
   /* find ts-offset element */
-  chain->ts_offset =
+  gst_object_replace ((GstObject **) & chain->ts_offset, (GstObject *)
       gst_play_sink_find_property_sinks (playsink, chain->sink, "ts-offset",
-      G_TYPE_INT64);
+          G_TYPE_INT64));
 
   /* check if the sink, or something within the sink, has the volume property.
    * If it does we don't need to add a volume element.  */
@@ -1956,29 +2837,33 @@ setup_audio_chain (GstPlaySink * playsink, gboolean raw)
       g_signal_connect (chain->mute, "notify::mute",
           G_CALLBACK (notify_mute_cb), playsink);
     }
-  } else {
+
+    g_object_set (chain->conv, "use-volume", FALSE, NULL);
+  } else if (conv) {
     /* no volume, we need to add a volume element when we can */
+    g_object_set (chain->conv, "use-volume",
+        ! !(playsink->flags & GST_PLAY_FLAG_SOFT_VOLUME), NULL);
     GST_DEBUG_OBJECT (playsink, "the sink has no volume property");
-    if (!raw) {
-      GST_LOG_OBJECT (playsink, "non-raw format, can't do soft volume control");
 
-      disconnect_chain (chain, playsink);
-      chain->volume = NULL;
-      chain->mute = NULL;
-    } else {
-      /* both last and current chain are raw audio, there should be a volume
-       * element already, unless the sink changed from one with a volume
-       * property to one that hasn't got a volume property, in which case we
-       * re-generate the chain */
-      if (chain->volume == NULL) {
-        GST_DEBUG_OBJECT (playsink, "no existing volume element to re-use");
-        /* undo background state change done earlier */
-        gst_element_set_state (chain->sink, GST_STATE_NULL);
-        return FALSE;
-      }
+    /* Disconnect signals */
+    disconnect_chain (chain, playsink);
 
-      GST_DEBUG_OBJECT (playsink, "reusing existing volume element");
+    if (conv->volume && (playsink->flags & GST_PLAY_FLAG_SOFT_VOLUME)) {
+      chain->volume = conv->volume;
+      chain->mute = chain->volume;
+
+      g_signal_connect (chain->volume, "notify::volume",
+          G_CALLBACK (notify_volume_cb), playsink);
+
+      g_signal_connect (chain->mute, "notify::mute",
+          G_CALLBACK (notify_mute_cb), playsink);
+
+      /* configure with the latest volume and mute */
+      g_object_set (G_OBJECT (chain->volume), "volume", playsink->volume, NULL);
+      g_object_set (G_OBJECT (chain->mute), "mute", playsink->mute, NULL);
     }
+
+    GST_DEBUG_OBJECT (playsink, "reusing existing volume element");
   }
   return TRUE;
 }
@@ -2120,12 +3005,49 @@ link_failed:
   }
 }
 
+gboolean
+gst_play_sink_reconfigure (GstPlaySink * playsink)
+{
+  GST_LOG_OBJECT (playsink, "Triggering reconfiguration");
+
+  GST_PLAY_SINK_LOCK (playsink);
+  if (playsink->video_pad) {
+    GstPad *opad =
+        GST_PAD_CAST (gst_proxy_pad_get_internal (GST_PROXY_PAD
+            (playsink->video_pad)));
+    gst_pad_set_blocked_async (opad, TRUE, sinkpad_blocked_cb, playsink);
+    PENDING_FLAG_SET (playsink, GST_PLAY_SINK_TYPE_VIDEO);
+    gst_object_unref (opad);
+  }
+
+  if (playsink->audio_pad) {
+    GstPad *opad =
+        GST_PAD_CAST (gst_proxy_pad_get_internal (GST_PROXY_PAD
+            (playsink->audio_pad)));
+    gst_pad_set_blocked_async (opad, TRUE, sinkpad_blocked_cb, playsink);
+    PENDING_FLAG_SET (playsink, GST_PLAY_SINK_TYPE_AUDIO);
+    gst_object_unref (opad);
+  }
+
+  if (playsink->text_pad) {
+    GstPad *opad =
+        GST_PAD_CAST (gst_proxy_pad_get_internal (GST_PROXY_PAD
+            (playsink->text_pad)));
+    gst_pad_set_blocked_async (opad, TRUE, sinkpad_blocked_cb, playsink);
+    PENDING_FLAG_SET (playsink, GST_PLAY_SINK_TYPE_TEXT);
+    gst_object_unref (opad);
+  }
+  GST_PLAY_SINK_UNLOCK (playsink);
+
+  return TRUE;
+}
+
 /* this function is called when all the request pads are requested and when we
  * have to construct the final pipeline. Based on the flags we construct the
  * final output pipelines.
  */
-gboolean
-gst_play_sink_reconfigure (GstPlaySink * playsink)
+static gboolean
+gst_play_sink_do_reconfigure (GstPlaySink * playsink)
 {
   GstPlayFlags flags;
   gboolean need_audio, need_video, need_deinterlace, need_vis, need_text;
@@ -2175,7 +3097,7 @@ gst_play_sink_reconfigure (GstPlaySink * playsink)
 
   /* we have a text_pad and we need text rendering, in this case we need a
    * video_pad to combine the video with the text or visualizations */
-  if (need_text && !need_video) {
+  if (need_text && !need_video && !playsink->text_sink) {
     if (playsink->video_pad) {
       need_video = TRUE;
     } else if (need_audio) {
@@ -2232,6 +3154,19 @@ gst_play_sink_reconfigure (GstPlaySink * playsink)
         activate_chain (GST_PLAY_CHAIN (playsink->videochain), FALSE);
         free_chain ((GstPlayChain *) playsink->videochain);
         playsink->videochain = NULL;
+
+        GST_OBJECT_LOCK (playsink);
+        if (playsink->xoverlay_element)
+          gst_object_unref (playsink->xoverlay_element);
+        playsink->xoverlay_element = NULL;
+
+        if (playsink->colorbalance_element) {
+          g_signal_handlers_disconnect_by_func (playsink->colorbalance_element,
+              G_CALLBACK (colorbalance_value_changed_cb), playsink);
+          gst_object_unref (playsink->colorbalance_element);
+        }
+        playsink->colorbalance_element = NULL;
+        GST_OBJECT_UNLOCK (playsink);
       }
     }
 
@@ -2273,6 +3208,8 @@ gst_play_sink_reconfigure (GstPlaySink * playsink)
       add_chain (GST_PLAY_CHAIN (playsink->videodeinterlacechain), TRUE);
       activate_chain (GST_PLAY_CHAIN (playsink->videodeinterlacechain), TRUE);
 
+      gst_pad_unlink (playsink->video_srcpad_stream_synchronizer,
+          playsink->videochain->sinkpad);
       gst_pad_link_full (playsink->video_srcpad_stream_synchronizer,
           playsink->videodeinterlacechain->sinkpad, GST_PAD_LINK_CHECK_NOTHING);
     } else {
@@ -2290,6 +3227,12 @@ gst_play_sink_reconfigure (GstPlaySink * playsink)
     if (!need_vis && !need_text && (!playsink->textchain
             || !playsink->text_pad)) {
       GST_DEBUG_OBJECT (playsink, "ghosting video sinkpad");
+      gst_pad_unlink (playsink->video_srcpad_stream_synchronizer,
+          playsink->videochain->sinkpad);
+      if (playsink->videodeinterlacechain
+          && playsink->videodeinterlacechain->srcpad)
+        gst_pad_unlink (playsink->videodeinterlacechain->srcpad,
+            playsink->videochain->sinkpad);
       if (need_deinterlace)
         gst_pad_link_full (playsink->videodeinterlacechain->srcpad,
             playsink->videochain->sinkpad, GST_PAD_LINK_CHECK_NOTHING);
@@ -2331,6 +3274,8 @@ gst_play_sink_reconfigure (GstPlaySink * playsink)
 
       add_chain (GST_PLAY_CHAIN (playsink->videochain), FALSE);
       activate_chain (GST_PLAY_CHAIN (playsink->videochain), FALSE);
+      if (playsink->videochain->ts_offset)
+        gst_object_unref (playsink->videochain->ts_offset);
       playsink->videochain->ts_offset = NULL;
     }
 
@@ -2341,6 +3286,19 @@ gst_play_sink_reconfigure (GstPlaySink * playsink)
 
     if (playsink->video_pad)
       gst_ghost_pad_set_target (GST_GHOST_PAD_CAST (playsink->video_pad), NULL);
+
+    GST_OBJECT_LOCK (playsink);
+    if (playsink->xoverlay_element)
+      gst_object_unref (playsink->xoverlay_element);
+    playsink->xoverlay_element = NULL;
+
+    if (playsink->colorbalance_element) {
+      g_signal_handlers_disconnect_by_func (playsink->colorbalance_element,
+          G_CALLBACK (colorbalance_value_changed_cb), playsink);
+      gst_object_unref (playsink->colorbalance_element);
+    }
+    playsink->colorbalance_element = NULL;
+    GST_OBJECT_UNLOCK (playsink);
   }
 
   if (need_audio) {
@@ -2384,6 +3342,8 @@ gst_play_sink_reconfigure (GstPlaySink * playsink)
         disconnect_chain (playsink->audiochain, playsink);
         playsink->audiochain->volume = NULL;
         playsink->audiochain->mute = NULL;
+        if (playsink->audiochain->ts_offset)
+          gst_object_unref (playsink->audiochain->ts_offset);
         playsink->audiochain->ts_offset = NULL;
         free_chain ((GstPlayChain *) playsink->audiochain);
         playsink->audiochain = NULL;
@@ -2452,6 +3412,8 @@ gst_play_sink_reconfigure (GstPlaySink * playsink)
         disconnect_chain (playsink->audiochain, playsink);
         playsink->audiochain->volume = NULL;
         playsink->audiochain->mute = NULL;
+        if (playsink->audiochain->ts_offset)
+          gst_object_unref (playsink->audiochain->ts_offset);
         playsink->audiochain->ts_offset = NULL;
       }
       add_chain (GST_PLAY_CHAIN (playsink->audiochain), FALSE);
@@ -2533,25 +3495,27 @@ gst_play_sink_reconfigure (GstPlaySink * playsink)
             playsink->textchain->textsinkpad, GST_PAD_LINK_CHECK_NOTHING);
       }
 
-      if (need_vis) {
-        GstPad *srcpad;
+      if (need_vis || need_video) {
+        if (need_vis) {
+          GstPad *srcpad;
 
-        srcpad =
-            gst_element_get_static_pad (playsink->vischain->chain.bin, "src");
-        gst_pad_unlink (srcpad, playsink->videochain->sinkpad);
-        gst_pad_link_full (srcpad, playsink->textchain->videosinkpad,
-            GST_PAD_LINK_CHECK_NOTHING);
-        gst_object_unref (srcpad);
-      } else {
-        if (need_deinterlace)
-          gst_pad_link_full (playsink->videodeinterlacechain->srcpad,
-              playsink->textchain->videosinkpad, GST_PAD_LINK_CHECK_NOTHING);
-        else
-          gst_pad_link_full (playsink->video_srcpad_stream_synchronizer,
-              playsink->textchain->videosinkpad, GST_PAD_LINK_CHECK_NOTHING);
+          srcpad =
+              gst_element_get_static_pad (playsink->vischain->chain.bin, "src");
+          gst_pad_unlink (srcpad, playsink->videochain->sinkpad);
+          gst_pad_link_full (srcpad, playsink->textchain->videosinkpad,
+              GST_PAD_LINK_CHECK_NOTHING);
+          gst_object_unref (srcpad);
+        } else {
+          if (need_deinterlace)
+            gst_pad_link_full (playsink->videodeinterlacechain->srcpad,
+                playsink->textchain->videosinkpad, GST_PAD_LINK_CHECK_NOTHING);
+          else
+            gst_pad_link_full (playsink->video_srcpad_stream_synchronizer,
+                playsink->textchain->videosinkpad, GST_PAD_LINK_CHECK_NOTHING);
+        }
+        gst_pad_link_full (playsink->textchain->srcpad,
+            playsink->videochain->sinkpad, GST_PAD_LINK_CHECK_NOTHING);
       }
-      gst_pad_link_full (playsink->textchain->srcpad,
-          playsink->videochain->sinkpad, GST_PAD_LINK_CHECK_NOTHING);
 
       activate_chain (GST_PLAY_CHAIN (playsink->textchain), TRUE);
     }
@@ -2843,10 +3807,230 @@ gst_play_sink_convert_frame (GstPlaySink * playsink, GstCaps * caps)
        * on the bus or not. It's not like it's a critical issue regarding
        * playsink behaviour. */
       GST_ERROR ("Error converting frame: %s", err->message);
+      g_error_free (err);
     }
     result = temp;
   }
   return result;
+}
+
+static gboolean
+is_raw_structure (GstStructure * s)
+{
+  const gchar *name;
+
+  name = gst_structure_get_name (s);
+
+  if (g_str_has_prefix (name, "video/x-raw-") ||
+      g_str_has_prefix (name, "audio/x-raw-"))
+    return TRUE;
+  return FALSE;
+}
+
+static gboolean
+is_raw_pad (GstPad * pad)
+{
+  GstPad *peer = gst_pad_get_peer (pad);
+  GstCaps *caps;
+  gboolean raw = TRUE;
+
+  if (!peer)
+    return raw;
+
+  caps = gst_pad_get_negotiated_caps (peer);
+  if (!caps) {
+    guint i, n;
+
+    caps = gst_pad_get_caps_reffed (peer);
+
+    n = gst_caps_get_size (caps);
+    for (i = 0; i < n; i++) {
+      gboolean r = is_raw_structure (gst_caps_get_structure (caps, i));
+
+      if (i == 0) {
+        raw = r;
+      } else if (raw != r) {
+        GST_ERROR_OBJECT (pad,
+            "Caps contains raw and non-raw structures: %" GST_PTR_FORMAT, caps);
+        raw = FALSE;
+        break;
+      }
+    }
+  } else {
+    raw = is_raw_structure (gst_caps_get_structure (caps, 0));
+  }
+  gst_caps_unref (caps);
+  gst_object_unref (peer);
+
+  return raw;
+}
+
+static void
+sinkpad_blocked_cb (GstPad * blockedpad, gboolean blocked, gpointer user_data)
+{
+  GstPlaySink *playsink = (GstPlaySink *) user_data;
+  GstPad *pad;
+
+  GST_PLAY_SINK_LOCK (playsink);
+
+  pad = GST_PAD_CAST (gst_proxy_pad_get_internal (GST_PROXY_PAD (blockedpad)));
+  if (pad == playsink->video_pad) {
+    playsink->video_pad_blocked = blocked;
+    GST_DEBUG_OBJECT (pad, "Video pad blocked: %d", blocked);
+    if (!blocked) {
+      PENDING_FLAG_UNSET (playsink, GST_PLAY_SINK_TYPE_VIDEO_RAW);
+      PENDING_FLAG_UNSET (playsink, GST_PLAY_SINK_TYPE_VIDEO);
+    }
+  } else if (pad == playsink->audio_pad) {
+    playsink->audio_pad_blocked = blocked;
+    GST_DEBUG_OBJECT (pad, "Audio pad blocked: %d", blocked);
+    if (!blocked) {
+      PENDING_FLAG_UNSET (playsink, GST_PLAY_SINK_TYPE_AUDIO_RAW);
+      PENDING_FLAG_UNSET (playsink, GST_PLAY_SINK_TYPE_AUDIO);
+    }
+  } else if (pad == playsink->text_pad) {
+    playsink->text_pad_blocked = blocked;
+    GST_DEBUG_OBJECT (pad, "Text pad blocked: %d", blocked);
+    if (!blocked)
+      PENDING_FLAG_UNSET (playsink, GST_PLAY_SINK_TYPE_TEXT);
+  }
+
+  if (!blocked) {
+    gst_object_unref (pad);
+    GST_PLAY_SINK_UNLOCK (playsink);
+    return;
+  }
+
+  /* We reconfigure when for ALL streams:
+   * * there isn't a pad
+   * * OR the pad is blocked
+   * * OR there are no pending blocks on that pad
+   */
+
+  if ((!playsink->video_pad || playsink->video_pad_blocked
+          || !PENDING_VIDEO_BLOCK (playsink)) && (!playsink->audio_pad
+          || playsink->audio_pad_blocked || !PENDING_AUDIO_BLOCK (playsink))
+      && (!playsink->text_pad || playsink->text_pad_blocked
+          || !PENDING_TEXT_BLOCK (playsink))) {
+    GST_DEBUG_OBJECT (playsink, "All pads blocked -- reconfiguring");
+
+    if (playsink->video_pad) {
+      playsink->video_pad_raw = is_raw_pad (playsink->video_pad);
+      GST_DEBUG_OBJECT (playsink, "Video pad is raw: %d",
+          playsink->video_pad_raw);
+    }
+
+    if (playsink->audio_pad) {
+      playsink->audio_pad_raw = is_raw_pad (playsink->audio_pad);
+      GST_DEBUG_OBJECT (playsink, "Audio pad is raw: %d",
+          playsink->audio_pad_raw);
+    }
+
+    gst_play_sink_do_reconfigure (playsink);
+
+    if (playsink->video_pad) {
+      GstPad *opad =
+          GST_PAD_CAST (gst_proxy_pad_get_internal (GST_PROXY_PAD
+              (playsink->video_pad)));
+      gst_pad_set_blocked_async (opad, FALSE, sinkpad_blocked_cb, playsink);
+      gst_object_unref (opad);
+    }
+
+    if (playsink->audio_pad) {
+      GstPad *opad =
+          GST_PAD_CAST (gst_proxy_pad_get_internal (GST_PROXY_PAD
+              (playsink->audio_pad)));
+      gst_pad_set_blocked_async (opad, FALSE, sinkpad_blocked_cb, playsink);
+      gst_object_unref (opad);
+    }
+
+    if (playsink->text_pad) {
+      GstPad *opad =
+          GST_PAD_CAST (gst_proxy_pad_get_internal (GST_PROXY_PAD
+              (playsink->text_pad)));
+      gst_pad_set_blocked_async (opad, FALSE, sinkpad_blocked_cb, playsink);
+      gst_object_unref (opad);
+    }
+  }
+
+  gst_object_unref (pad);
+
+  GST_PLAY_SINK_UNLOCK (playsink);
+}
+
+static void
+caps_notify_cb (GstPad * pad, GParamSpec * unused, GstPlaySink * playsink)
+{
+  gboolean reconfigure = FALSE;
+  GstCaps *caps;
+  gboolean raw;
+
+  g_object_get (pad, "caps", &caps, NULL);
+  if (!caps)
+    return;
+
+  if (pad == playsink->audio_pad) {
+    raw = is_raw_pad (pad);
+    reconfigure = (! !playsink->audio_pad_raw != ! !raw)
+        && playsink->audiochain;
+    GST_DEBUG_OBJECT (pad,
+        "Audio caps changed: raw %d reconfigure %d caps %" GST_PTR_FORMAT, raw,
+        reconfigure, caps);
+  } else if (pad == playsink->video_pad) {
+    raw = is_raw_pad (pad);
+    reconfigure = (! !playsink->video_pad_raw != ! !raw)
+        && playsink->videochain;
+    GST_DEBUG_OBJECT (pad,
+        "Video caps changed: raw %d reconfigure %d caps %" GST_PTR_FORMAT, raw,
+        reconfigure, caps);
+  }
+
+  gst_caps_unref (caps);
+
+  if (reconfigure)
+    gst_play_sink_reconfigure (playsink);
+}
+
+void
+gst_play_sink_refresh_pad (GstPlaySink * playsink, GstPad * pad,
+    GstPlaySinkType type)
+{
+  GST_DEBUG_OBJECT (playsink, "refresh pad %" GST_PTR_FORMAT, pad);
+
+  GST_PLAY_SINK_LOCK (playsink);
+  if (pad == playsink->video_pad) {
+    if (type != GST_PLAY_SINK_TYPE_VIDEO_RAW &&
+        type != GST_PLAY_SINK_TYPE_VIDEO)
+      goto wrong_type;
+  } else if (pad == playsink->audio_pad) {
+    if (type != GST_PLAY_SINK_TYPE_AUDIO_RAW &&
+        type != GST_PLAY_SINK_TYPE_AUDIO)
+      goto wrong_type;
+  } else if (pad == playsink->text_pad) {
+    if (type != GST_PLAY_SINK_TYPE_TEXT)
+      goto wrong_type;
+  }
+
+  if (type != GST_PLAY_SINK_TYPE_FLUSHING) {
+    GstPad *blockpad =
+        GST_PAD_CAST (gst_proxy_pad_get_internal (GST_PROXY_PAD (pad)));
+
+    gst_pad_set_blocked_async (blockpad, TRUE, sinkpad_blocked_cb, playsink);
+    PENDING_FLAG_SET (playsink, type);
+    gst_object_unref (blockpad);
+  }
+  GST_PLAY_SINK_UNLOCK (playsink);
+
+  return;
+
+  /* ERRORS */
+wrong_type:
+  {
+    GST_WARNING_OBJECT (playsink, "wrong type %d for pad %" GST_PTR_FORMAT,
+        type, pad);
+    GST_PLAY_SINK_UNLOCK (playsink);
+    return;
+  }
 }
 
 /**
@@ -2863,7 +4047,6 @@ gst_play_sink_request_pad (GstPlaySink * playsink, GstPlaySinkType type)
 {
   GstPad *res = NULL;
   gboolean created = FALSE;
-  gboolean raw = FALSE;
   gboolean activate = TRUE;
   const gchar *pad_name = NULL;
 
@@ -2872,11 +4055,8 @@ gst_play_sink_request_pad (GstPlaySink * playsink, GstPlaySinkType type)
   GST_PLAY_SINK_LOCK (playsink);
   switch (type) {
     case GST_PLAY_SINK_TYPE_AUDIO_RAW:
-      pad_name = "audio_raw_sink";
-      raw = TRUE;
     case GST_PLAY_SINK_TYPE_AUDIO:
-      if (pad_name == NULL)
-        pad_name = "audio_sink";
+      pad_name = "audio_sink";
       if (!playsink->audio_tee) {
         GST_LOG_OBJECT (playsink, "creating tee");
         /* create tee when needed. This element will feed the audio sink chain
@@ -2902,24 +4082,25 @@ gst_play_sink_request_pad (GstPlaySink * playsink, GstPlaySinkType type)
         GST_LOG_OBJECT (playsink, "ghosting tee sinkpad");
         playsink->audio_pad =
             gst_ghost_pad_new (pad_name, playsink->audio_tee_sink);
+        g_signal_connect (G_OBJECT (playsink->audio_pad), "notify::caps",
+            G_CALLBACK (caps_notify_cb), playsink);
         created = TRUE;
       }
-      playsink->audio_pad_raw = raw;
+      playsink->audio_pad_raw = FALSE;
       res = playsink->audio_pad;
       break;
     case GST_PLAY_SINK_TYPE_VIDEO_RAW:
-      pad_name = "video_raw_sink";
-      raw = TRUE;
     case GST_PLAY_SINK_TYPE_VIDEO:
-      if (pad_name == NULL)
-        pad_name = "video_sink";
+      pad_name = "video_sink";
       if (!playsink->video_pad) {
         GST_LOG_OBJECT (playsink, "ghosting videosink");
         playsink->video_pad =
             gst_ghost_pad_new_no_target (pad_name, GST_PAD_SINK);
+        g_signal_connect (G_OBJECT (playsink->video_pad), "notify::caps",
+            G_CALLBACK (caps_notify_cb), playsink);
         created = TRUE;
       }
-      playsink->video_pad_raw = raw;
+      playsink->video_pad_raw = FALSE;
       res = playsink->video_pad;
       break;
     case GST_PLAY_SINK_TYPE_TEXT:
@@ -2955,12 +4136,21 @@ gst_play_sink_request_pad (GstPlaySink * playsink, GstPlaySinkType type)
      * element is 'running' */
     gst_pad_set_active (res, TRUE);
     gst_element_add_pad (GST_ELEMENT_CAST (playsink), res);
+    if (type != GST_PLAY_SINK_TYPE_FLUSHING) {
+      GstPad *blockpad =
+          GST_PAD_CAST (gst_proxy_pad_get_internal (GST_PROXY_PAD (res)));
+
+      gst_pad_set_blocked_async (blockpad, TRUE, sinkpad_blocked_cb, playsink);
+      PENDING_FLAG_SET (playsink, type);
+      gst_object_unref (blockpad);
+    }
     if (!activate)
       gst_pad_set_active (res, activate);
   }
 
   return res;
 }
+
 
 static GstPad *
 gst_play_sink_request_new_pad (GstElement * element, GstPadTemplate * templ,
@@ -3011,8 +4201,12 @@ gst_play_sink_release_pad (GstPlaySink * playsink, GstPad * pad)
   GST_PLAY_SINK_LOCK (playsink);
   if (pad == playsink->video_pad) {
     res = &playsink->video_pad;
+    g_signal_handlers_disconnect_by_func (playsink->video_pad, caps_notify_cb,
+        playsink);
   } else if (pad == playsink->audio_pad) {
     res = &playsink->audio_pad;
+    g_signal_handlers_disconnect_by_func (playsink->audio_pad, caps_notify_cb,
+        playsink);
   } else if (pad == playsink->text_pad) {
     res = &playsink->text_pad;
   } else {
@@ -3080,6 +4274,46 @@ gst_play_sink_handle_message (GstBin * bin, GstMessage * message)
       GST_BIN_CLASS (gst_play_sink_parent_class)->handle_message (bin, message);
       break;
     }
+    case GST_MESSAGE_ELEMENT:{
+      if (gst_structure_has_name (message->structure, "prepare-xwindow-id")) {
+        GstXOverlay *xoverlay;
+
+        GST_OBJECT_LOCK (playsink);
+        if (playsink->xoverlay_element
+            && GST_OBJECT_CAST (playsink->xoverlay_element) !=
+            GST_MESSAGE_SRC (message)) {
+          gst_object_unref (playsink->xoverlay_element);
+          playsink->xoverlay_element = NULL;
+        }
+
+        if (!playsink->xoverlay_element)
+          playsink->xoverlay_element =
+              GST_X_OVERLAY (gst_object_ref (GST_MESSAGE_SRC (message)));
+        xoverlay = GST_X_OVERLAY (gst_object_ref (playsink->xoverlay_element));
+        GST_OBJECT_UNLOCK (playsink);
+
+        GST_DEBUG_OBJECT (playsink, "Got prepare-xwindow-id message");
+
+        if (playsink->xoverlay_handle_set)
+          gst_x_overlay_set_window_handle (playsink->xoverlay_element,
+              playsink->xoverlay_handle);
+        if (playsink->xoverlay_handle_events_set)
+          gst_x_overlay_handle_events (playsink->xoverlay_element,
+              playsink->xoverlay_handle_events);
+        if (playsink->xoverlay_render_rectangle_set)
+          gst_x_overlay_set_render_rectangle (playsink->xoverlay_element,
+              playsink->xoverlay_x, playsink->xoverlay_y,
+              playsink->xoverlay_width, playsink->xoverlay_height);
+
+        gst_object_unref (xoverlay);
+        gst_message_unref (message);
+        gst_x_overlay_prepare_xwindow_id (GST_X_OVERLAY (playsink));
+      } else {
+        GST_BIN_CLASS (gst_play_sink_parent_class)->handle_message (bin,
+            message);
+      }
+      break;
+    }
     default:
       GST_BIN_CLASS (gst_play_sink_parent_class)->handle_message (bin, message);
       break;
@@ -3095,31 +4329,41 @@ static gboolean
 gst_play_sink_send_event_to_sink (GstPlaySink * playsink, GstEvent * event)
 {
   gboolean res = TRUE;
+  if (playsink->send_event_mode == MODE_FIRST) {
+    if (playsink->textchain && playsink->textchain->sink) {
+      gst_event_ref (event);
+      if ((res =
+              gst_element_send_event (playsink->textchain->chain.bin, event))) {
+        GST_DEBUG_OBJECT (playsink, "Sent event successfully to text sink");
+      } else {
+        GST_DEBUG_OBJECT (playsink, "Event failed when sent to text sink");
+      }
+    }
 
-  if (playsink->textchain && playsink->textchain->sink) {
-    gst_event_ref (event);
-    if ((res = gst_element_send_event (playsink->textchain->chain.bin, event))) {
-      GST_DEBUG_OBJECT (playsink, "Sent event succesfully to text sink");
-    } else {
-      GST_DEBUG_OBJECT (playsink, "Event failed when sent to text sink");
+    if (playsink->videochain) {
+      gst_event_ref (event);
+      if ((res =
+              gst_element_send_event (playsink->videochain->chain.bin,
+                  event))) {
+        GST_DEBUG_OBJECT (playsink, "Sent event successfully to video sink");
+        goto done;
+      }
+      GST_DEBUG_OBJECT (playsink, "Event failed when sent to video sink");
     }
-  }
-
-  if (playsink->videochain) {
-    gst_event_ref (event);
-    if ((res = gst_element_send_event (playsink->videochain->chain.bin, event))) {
-      GST_DEBUG_OBJECT (playsink, "Sent event succesfully to video sink");
-      goto done;
+    if (playsink->audiochain) {
+      gst_event_ref (event);
+      if ((res =
+              gst_element_send_event (playsink->audiochain->chain.bin,
+                  event))) {
+        GST_DEBUG_OBJECT (playsink, "Sent event successfully to audio sink");
+        goto done;
+      }
+      GST_DEBUG_OBJECT (playsink, "Event failed when sent to audio sink");
     }
-    GST_DEBUG_OBJECT (playsink, "Event failed when sent to video sink");
-  }
-  if (playsink->audiochain) {
-    gst_event_ref (event);
-    if ((res = gst_element_send_event (playsink->audiochain->chain.bin, event))) {
-      GST_DEBUG_OBJECT (playsink, "Sent event succesfully to audio sink");
-      goto done;
-    }
-    GST_DEBUG_OBJECT (playsink, "Event failed when sent to audio sink");
+  } else {
+    return
+        GST_ELEMENT_CLASS (gst_play_sink_parent_class)->send_event
+        (GST_ELEMENT_CAST (playsink), event);
   }
 
 done:
@@ -3136,9 +4380,7 @@ gst_play_sink_send_event (GstElement * element, GstEvent * event)
   gboolean res = FALSE;
   GstEventType event_type = GST_EVENT_TYPE (event);
   GstPlaySink *playsink;
-
   playsink = GST_PLAY_SINK_CAST (element);
-
   switch (event_type) {
     case GST_EVENT_SEEK:
       GST_DEBUG_OBJECT (element, "Sending event to a sink");
@@ -3150,10 +4392,8 @@ gst_play_sink_send_event (GstElement * element, GstEvent * event)
       guint64 amount;
       gdouble rate;
       gboolean flush, intermediate;
-
       gst_event_parse_step (event, &format, &amount, &rate, &flush,
           &intermediate);
-
       if (format == GST_FORMAT_BUFFERS) {
         /* for buffers, we will try to step video frames, for other formats we
          * send the step to all sinks */
@@ -3179,20 +4419,59 @@ gst_play_sink_change_state (GstElement * element, GstStateChange transition)
 {
   GstStateChangeReturn ret;
   GstStateChangeReturn bret;
-
   GstPlaySink *playsink;
-
   playsink = GST_PLAY_SINK (element);
-
   switch (transition) {
     case GST_STATE_CHANGE_READY_TO_PAUSED:
+      gst_segment_init (&playsink->text_segment, GST_FORMAT_UNDEFINED);
+
       playsink->need_async_start = TRUE;
       /* we want to go async to PAUSED until we managed to configure and add the
        * sinks */
       do_async_start (playsink);
       ret = GST_STATE_CHANGE_ASYNC;
+
+      /* block all pads here */
+      if (!gst_play_sink_reconfigure (playsink))
+        ret = GST_STATE_CHANGE_FAILURE;
       break;
     case GST_STATE_CHANGE_PAUSED_TO_READY:
+      /* unblock all pads here */
+      GST_PLAY_SINK_LOCK (playsink);
+      if (playsink->video_pad) {
+        GstPad *opad =
+            GST_PAD_CAST (gst_proxy_pad_get_internal (GST_PROXY_PAD
+                (playsink->video_pad)));
+        if (gst_pad_is_blocked (opad)) {
+          gst_pad_set_blocked_async (opad, FALSE, sinkpad_blocked_cb, playsink);
+        }
+        gst_object_unref (opad);
+        playsink->video_pad_blocked = FALSE;
+      }
+
+      if (playsink->audio_pad) {
+        GstPad *opad =
+            GST_PAD_CAST (gst_proxy_pad_get_internal (GST_PROXY_PAD
+                (playsink->audio_pad)));
+        if (gst_pad_is_blocked (opad)) {
+          gst_pad_set_blocked_async (opad, FALSE, sinkpad_blocked_cb, playsink);
+        }
+        gst_object_unref (opad);
+        playsink->audio_pad_blocked = FALSE;
+      }
+
+      if (playsink->text_pad) {
+        GstPad *opad =
+            GST_PAD_CAST (gst_proxy_pad_get_internal (GST_PROXY_PAD
+                (playsink->text_pad)));
+        if (gst_pad_is_blocked (opad)) {
+          gst_pad_set_blocked_async (opad, FALSE, sinkpad_blocked_cb, playsink);
+        }
+        gst_object_unref (opad);
+        playsink->text_pad_blocked = FALSE;
+      }
+      GST_PLAY_SINK_UNLOCK (playsink);
+      /* fall through */
     case GST_STATE_CHANGE_READY_TO_NULL:
       if (playsink->audiochain && playsink->audiochain->sink_volume) {
         /* remove our links to the mute and volume elements when they were
@@ -3200,8 +4479,31 @@ gst_play_sink_change_state (GstElement * element, GstStateChange transition)
         disconnect_chain (playsink->audiochain, playsink);
         playsink->audiochain->volume = NULL;
         playsink->audiochain->mute = NULL;
+      }
+
+      if (playsink->audiochain && playsink->audiochain->ts_offset) {
+        gst_object_unref (playsink->audiochain->ts_offset);
         playsink->audiochain->ts_offset = NULL;
       }
+
+      if (playsink->videochain && playsink->videochain->ts_offset) {
+        gst_object_unref (playsink->videochain->ts_offset);
+        playsink->videochain->ts_offset = NULL;
+      }
+
+      GST_OBJECT_LOCK (playsink);
+      if (playsink->xoverlay_element)
+        gst_object_unref (playsink->xoverlay_element);
+      playsink->xoverlay_element = NULL;
+
+      if (playsink->colorbalance_element) {
+        g_signal_handlers_disconnect_by_func (playsink->colorbalance_element,
+            G_CALLBACK (colorbalance_value_changed_cb), playsink);
+        gst_object_unref (playsink->colorbalance_element);
+      }
+      playsink->colorbalance_element = NULL;
+      GST_OBJECT_UNLOCK (playsink);
+
       ret = GST_STATE_CHANGE_SUCCESS;
       break;
     default:
@@ -3311,7 +4613,6 @@ gst_play_sink_change_state (GstElement * element, GstStateChange transition)
         if (playsink->textchain && playsink->textchain->sink)
           gst_bin_remove (GST_BIN_CAST (playsink->textchain->chain.bin),
               playsink->textchain->sink);
-
         if (playsink->audio_sink != NULL)
           gst_element_set_state (playsink->audio_sink, GST_STATE_NULL);
         if (playsink->video_sink != NULL)
@@ -3320,7 +4621,6 @@ gst_play_sink_change_state (GstElement * element, GstStateChange transition)
           gst_element_set_state (playsink->visualisation, GST_STATE_NULL);
         if (playsink->text_sink != NULL)
           gst_element_set_state (playsink->text_sink, GST_STATE_NULL);
-
         free_chain ((GstPlayChain *) playsink->videodeinterlacechain);
         playsink->videodeinterlacechain = NULL;
         free_chain ((GstPlayChain *) playsink->videochain);
@@ -3337,7 +4637,6 @@ gst_play_sink_change_state (GstElement * element, GstStateChange transition)
       break;
   }
   return ret;
-
   /* ERRORS */
 activate_failed:
   {
@@ -3352,7 +4651,6 @@ gst_play_sink_set_property (GObject * object, guint prop_id,
     const GValue * value, GParamSpec * spec)
 {
   GstPlaySink *playsink = GST_PLAY_SINK (object);
-
   switch (prop_id) {
     case PROP_FLAGS:
       gst_play_sink_set_flags (playsink, g_value_get_flags (value));
@@ -3376,6 +4674,44 @@ gst_play_sink_set_property (GObject * object, guint prop_id,
     case PROP_AV_OFFSET:
       gst_play_sink_set_av_offset (playsink, g_value_get_int64 (value));
       break;
+    case PROP_VIDEO_SINK:
+      gst_play_sink_set_sink (playsink, GST_PLAY_SINK_TYPE_VIDEO,
+          g_value_get_object (value));
+      break;
+    case PROP_AUDIO_SINK:
+      gst_play_sink_set_sink (playsink, GST_PLAY_SINK_TYPE_AUDIO,
+          g_value_get_object (value));
+      break;
+    case PROP_TEXT_SINK:
+      gst_play_sink_set_sink (playsink, GST_PLAY_SINK_TYPE_TEXT,
+          g_value_get_object (value));
+      break;
+    case PROP_SEND_EVENT_MODE:
+      playsink->send_event_mode = g_value_get_enum (value);
+      break;
+    case PROP_FORCE_ASPECT_RATIO:{
+      GstPlayVideoChain *chain;
+      GstElement *elem;
+
+      playsink->force_aspect_ratio = g_value_get_boolean (value);
+
+      GST_PLAY_SINK_LOCK (playsink);
+      if (playsink->videochain) {
+        chain = (GstPlayVideoChain *) playsink->videochain;
+
+        if (chain->sink) {
+          elem =
+              gst_play_sink_find_property_sinks (playsink, chain->sink,
+              "force-aspect-ratio", G_TYPE_BOOLEAN);
+
+          if (elem)
+            g_object_set (elem, "force-aspect-ratio",
+                playsink->force_aspect_ratio, NULL);
+        }
+      }
+      GST_PLAY_SINK_UNLOCK (playsink);
+      break;
+    }
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, spec);
       break;
@@ -3387,7 +4723,6 @@ gst_play_sink_get_property (GObject * object, guint prop_id,
     GValue * value, GParamSpec * spec)
 {
   GstPlaySink *playsink = GST_PLAY_SINK (object);
-
   switch (prop_id) {
     case PROP_FLAGS:
       g_value_set_flags (value, gst_play_sink_get_flags (playsink));
@@ -3414,18 +4749,315 @@ gst_play_sink_get_property (GObject * object, guint prop_id,
     case PROP_AV_OFFSET:
       g_value_set_int64 (value, gst_play_sink_get_av_offset (playsink));
       break;
+    case PROP_VIDEO_SINK:
+      g_value_take_object (value, gst_play_sink_get_sink (playsink,
+              GST_PLAY_SINK_TYPE_VIDEO));
+      break;
+    case PROP_AUDIO_SINK:
+      g_value_take_object (value, gst_play_sink_get_sink (playsink,
+              GST_PLAY_SINK_TYPE_AUDIO));
+      break;
+    case PROP_TEXT_SINK:
+      g_value_take_object (value, gst_play_sink_get_sink (playsink,
+              GST_PLAY_SINK_TYPE_TEXT));
+      break;
+    case PROP_SEND_EVENT_MODE:
+      g_value_set_enum (value, playsink->send_event_mode);
+      break;
+    case PROP_FORCE_ASPECT_RATIO:
+      g_value_set_boolean (value, playsink->force_aspect_ratio);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, spec);
       break;
   }
 }
 
+static void
+gst_play_sink_xoverlay_expose (GstXOverlay * overlay)
+{
+  GstPlaySink *playsink = GST_PLAY_SINK (overlay);
+  GstXOverlay *xoverlay;
+
+  GST_OBJECT_LOCK (playsink);
+  if (playsink->xoverlay_element)
+    xoverlay = GST_X_OVERLAY (gst_object_ref (playsink->xoverlay_element));
+  else
+    xoverlay = NULL;
+  GST_OBJECT_UNLOCK (playsink);
+
+  if (xoverlay) {
+    gst_x_overlay_expose (xoverlay);
+    gst_object_unref (xoverlay);
+  }
+}
+
+static void
+gst_play_sink_xoverlay_handle_events (GstXOverlay * overlay,
+    gboolean handle_events)
+{
+  GstPlaySink *playsink = GST_PLAY_SINK (overlay);
+  GstXOverlay *xoverlay;
+
+  GST_OBJECT_LOCK (playsink);
+  if (playsink->xoverlay_element)
+    xoverlay = GST_X_OVERLAY (gst_object_ref (playsink->xoverlay_element));
+  else
+    xoverlay = NULL;
+  GST_OBJECT_UNLOCK (playsink);
+
+  playsink->xoverlay_handle_events_set = TRUE;
+  playsink->xoverlay_handle_events = handle_events;
+
+  if (xoverlay) {
+    gst_x_overlay_handle_events (xoverlay, handle_events);
+    gst_object_unref (xoverlay);
+  }
+}
+
+static void
+gst_play_sink_xoverlay_set_render_rectangle (GstXOverlay * overlay, gint x,
+    gint y, gint width, gint height)
+{
+  GstPlaySink *playsink = GST_PLAY_SINK (overlay);
+  GstXOverlay *xoverlay;
+
+  GST_OBJECT_LOCK (playsink);
+  if (playsink->xoverlay_element)
+    xoverlay = GST_X_OVERLAY (gst_object_ref (playsink->xoverlay_element));
+  else
+    xoverlay = NULL;
+  GST_OBJECT_UNLOCK (playsink);
+
+  playsink->xoverlay_render_rectangle_set = TRUE;
+  playsink->xoverlay_x = x;
+  playsink->xoverlay_y = y;
+  playsink->xoverlay_width = width;
+  playsink->xoverlay_height = height;
+
+  if (xoverlay) {
+    gst_x_overlay_set_render_rectangle (xoverlay, x, y, width, height);
+    gst_object_unref (xoverlay);
+  }
+}
+
+static void
+gst_play_sink_xoverlay_set_window_handle (GstXOverlay * overlay,
+    guintptr handle)
+{
+  GstPlaySink *playsink = GST_PLAY_SINK (overlay);
+  GstXOverlay *xoverlay;
+
+  GST_OBJECT_LOCK (playsink);
+  if (playsink->xoverlay_element)
+    xoverlay = GST_X_OVERLAY (gst_object_ref (playsink->xoverlay_element));
+  else
+    xoverlay = NULL;
+  GST_OBJECT_UNLOCK (playsink);
+
+  playsink->xoverlay_handle_set = TRUE;
+  playsink->xoverlay_handle = handle;
+
+  if (xoverlay) {
+    gst_x_overlay_set_window_handle (xoverlay, handle);
+    gst_object_unref (xoverlay);
+  }
+}
+
+static void
+gst_play_sink_xoverlay_init (gpointer g_iface, gpointer g_iface_data)
+{
+  GstXOverlayClass *iface = (GstXOverlayClass *) g_iface;
+  iface->expose = gst_play_sink_xoverlay_expose;
+  iface->handle_events = gst_play_sink_xoverlay_handle_events;
+  iface->set_render_rectangle = gst_play_sink_xoverlay_set_render_rectangle;
+  iface->set_window_handle = gst_play_sink_xoverlay_set_window_handle;
+}
+
+static gboolean
+gst_play_sink_implements_interface_supported (GstImplementsInterface * iface,
+    GType type)
+{
+  if (type == GST_TYPE_X_OVERLAY || type == GST_TYPE_STREAM_VOLUME ||
+      type == GST_TYPE_NAVIGATION || type == GST_TYPE_COLOR_BALANCE)
+    return TRUE;
+  else
+    return FALSE;
+}
+
+static void
+gst_play_sink_implements_interface_init (gpointer g_iface,
+    gpointer g_iface_data)
+{
+  GstImplementsInterfaceClass *iface = (GstImplementsInterfaceClass *) g_iface;
+  iface->supported = gst_play_sink_implements_interface_supported;
+}
+
+static void
+gst_play_sink_navigation_send_event (GstNavigation * navigation,
+    GstStructure * structure)
+{
+  GstPlaySink *playsink = GST_PLAY_SINK (navigation);
+  GstBin *bin = NULL;
+
+  GST_PLAY_SINK_LOCK (playsink);
+  if (playsink->videochain && playsink->videochain->chain.bin)
+    bin = GST_BIN (gst_object_ref (playsink->videochain->chain.bin));
+  GST_PLAY_SINK_UNLOCK (playsink);
+
+  if (bin) {
+    GstElement *nav = gst_bin_get_by_interface (bin, GST_TYPE_NAVIGATION);
+
+    if (nav) {
+      gst_navigation_send_event (GST_NAVIGATION (nav), structure);
+      structure = NULL;
+      gst_object_unref (nav);
+    } else {
+      GstEvent *event = gst_event_new_navigation (structure);
+      structure = NULL;
+      gst_element_send_event (GST_ELEMENT (bin), event);
+    }
+
+    gst_object_unref (bin);
+  }
+
+  if (structure)
+    gst_structure_free (structure);
+}
+
+static void
+gst_play_sink_navigation_init (gpointer g_iface, gpointer g_iface_data)
+{
+  GstNavigationInterface *iface = (GstNavigationInterface *) g_iface;
+
+  iface->send_event = gst_play_sink_navigation_send_event;
+}
+
+static const GList *
+gst_play_sink_colorbalance_list_channels (GstColorBalance * balance)
+{
+  GstPlaySink *playsink = GST_PLAY_SINK (balance);
+
+  return playsink->colorbalance_channels;
+}
+
+static void
+gst_play_sink_colorbalance_set_value (GstColorBalance * balance,
+    GstColorBalanceChannel * proxy, gint value)
+{
+  GstPlaySink *playsink = GST_PLAY_SINK (balance);
+  GList *l;
+  gint i;
+  GstColorBalance *balance_element = NULL;
+
+  GST_OBJECT_LOCK (playsink);
+  if (playsink->colorbalance_element)
+    balance_element =
+        GST_COLOR_BALANCE (gst_object_ref (playsink->colorbalance_element));
+  GST_OBJECT_UNLOCK (playsink);
+
+  for (i = 0, l = playsink->colorbalance_channels; l; l = l->next, i++) {
+    GstColorBalanceChannel *proxy_tmp = l->data;
+    gdouble new_val;
+
+    if (proxy_tmp != proxy)
+      continue;
+
+    playsink->colorbalance_values[i] = value;
+
+    if (balance_element) {
+      GstColorBalanceChannel *channel = NULL;
+      const GList *channels, *k;
+
+      channels = gst_color_balance_list_channels (balance_element);
+      for (k = channels; k; k = k->next) {
+        GstColorBalanceChannel *tmp = l->data;
+
+        if (g_strrstr (tmp->label, proxy->label)) {
+          channel = tmp;
+          break;
+        }
+      }
+
+      g_assert (channel);
+
+      /* Convert to [0, 1] range */
+      new_val =
+          ((gdouble) value -
+          (gdouble) proxy->min_value) / ((gdouble) proxy->max_value -
+          (gdouble) proxy->min_value);
+      /* Convert to channel range */
+      new_val =
+          channel->min_value + new_val * ((gdouble) channel->max_value -
+          (gdouble) channel->min_value);
+
+      gst_color_balance_set_value (balance_element, channel,
+          (gint) (new_val + 0.5));
+
+      gst_object_unref (balance_element);
+    }
+
+    gst_color_balance_value_changed (balance, proxy, value);
+    break;
+  }
+}
+
+static gint
+gst_play_sink_colorbalance_get_value (GstColorBalance * balance,
+    GstColorBalanceChannel * proxy)
+{
+  GstPlaySink *playsink = GST_PLAY_SINK (balance);
+  GList *l;
+  gint i;
+
+  for (i = 0, l = playsink->colorbalance_channels; l; l = l->next, i++) {
+    GstColorBalanceChannel *proxy_tmp = l->data;
+
+    if (proxy_tmp != proxy)
+      continue;
+
+    return playsink->colorbalance_values[i];
+  }
+
+  g_return_val_if_reached (0);
+}
+
+static GstColorBalanceType
+gst_play_sink_colorbalance_get_balance_type (GstColorBalance * balance)
+{
+  GstPlaySink *playsink = GST_PLAY_SINK (balance);
+  GstColorBalance *balance_element = NULL;
+  GstColorBalanceType t = GST_COLOR_BALANCE_SOFTWARE;
+
+  GST_OBJECT_LOCK (playsink);
+  if (playsink->colorbalance_element)
+    balance_element =
+        GST_COLOR_BALANCE (gst_object_ref (playsink->colorbalance_element));
+  GST_OBJECT_UNLOCK (playsink);
+
+  if (balance_element) {
+    t = gst_color_balance_get_balance_type (balance_element);
+    gst_object_unref (balance_element);
+  }
+
+  return t;
+}
+
+static void
+gst_play_sink_colorbalance_init (gpointer g_iface, gpointer g_iface_data)
+{
+  GstColorBalanceClass *iface = (GstColorBalanceClass *) g_iface;
+
+  iface->list_channels = gst_play_sink_colorbalance_list_channels;
+  iface->set_value = gst_play_sink_colorbalance_set_value;
+  iface->get_value = gst_play_sink_colorbalance_get_value;
+  iface->get_balance_type = gst_play_sink_colorbalance_get_balance_type;
+}
 
 gboolean
 gst_play_sink_plugin_init (GstPlugin * plugin)
 {
   GST_DEBUG_CATEGORY_INIT (gst_play_sink_debug, "playsink", 0, "play bin");
-
   return gst_element_register (plugin, "playsink", GST_RANK_NONE,
       GST_TYPE_PLAY_SINK);
 }

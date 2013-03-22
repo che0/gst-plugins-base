@@ -66,10 +66,24 @@ typedef enum
   GST_COLOR_BALANCE_SOFTWARE
 } GstColorBalanceType;
 
+/**
+ * GstColorBalanceClass:
+ * @klass: the parent interface
+ * @balance_type: implementation type
+ * @list_channels: list handled channels
+ * @set_value: set a channel value
+ * @get_value: get a channel value
+ * @value_changed: default handler for value changed notification
+ *
+ * Color-balance interface.
+ */
 struct _GstColorBalanceClass {
   GTypeInterface klass;
 
+/* FIXME 0.11: Remove this */
+#ifndef GST_REMOVE_DEPRECATED
   GstColorBalanceType balance_type;
+#endif
 
   /* virtual functions */
   const GList * (* list_channels) (GstColorBalance        *balance);
@@ -85,7 +99,10 @@ struct _GstColorBalanceClass {
                           GstColorBalanceChannel *channel,
                           gint                    value);
 
-  gpointer _gst_reserved[GST_PADDING];
+  GstColorBalanceType (*get_balance_type)  (GstColorBalance *balance);
+
+  /*< private >*/
+  gpointer _gst_reserved[GST_PADDING-1];
 };
 
 GType   gst_color_balance_get_type      (void);

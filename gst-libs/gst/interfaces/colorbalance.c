@@ -102,13 +102,15 @@ gst_color_balance_class_init (GstColorBalanceClass * klass)
 
     initialized = TRUE;
   }
-
+#ifndef GST_REMOVE_DEPRECATED
   klass->balance_type = GST_COLOR_BALANCE_SOFTWARE;
+#endif
 
   /* default virtual functions */
   klass->list_channels = NULL;
   klass->set_value = NULL;
   klass->get_value = NULL;
+  klass->get_balance_type = NULL;
 }
 
 /**
@@ -124,7 +126,11 @@ gst_color_balance_class_init (GstColorBalanceClass * klass)
 const GList *
 gst_color_balance_list_channels (GstColorBalance * balance)
 {
-  GstColorBalanceClass *klass = GST_COLOR_BALANCE_GET_CLASS (balance);
+  GstColorBalanceClass *klass;
+
+  g_return_val_if_fail (GST_IS_COLOR_BALANCE (balance), NULL);
+
+  klass = GST_COLOR_BALANCE_GET_CLASS (balance);
 
   if (klass->list_channels) {
     return klass->list_channels (balance);
@@ -142,8 +148,8 @@ gst_color_balance_list_channels (GstColorBalance * balance)
  * Sets the current value of the channel to the passed value, which must
  * be between min_value and max_value.
  * 
- * See Also: The #GstColorBalanceChannel::min_value and
- *         #GstColorBalanceChannel::max_value members of the
+ * See Also: The #GstColorBalanceChannel.min_value and
+ *         #GstColorBalanceChannel.max_value members of the
  *         #GstColorBalanceChannel object.
  */
 void
@@ -165,8 +171,8 @@ gst_color_balance_set_value (GstColorBalance * balance,
  * Retrieve the current value of the indicated channel, between min_value
  * and max_value.
  * 
- * See Also: The #GstColorBalanceChannel::min_value and
- *         #GstColorBalanceChannel::max_value members of the
+ * See Also: The #GstColorBalanceChannel.min_value and
+ *         #GstColorBalanceChannel.max_value members of the
  *         #GstColorBalanceChannel object.
  * 
  * Returns: The current value of the channel.
@@ -175,7 +181,11 @@ gint
 gst_color_balance_get_value (GstColorBalance * balance,
     GstColorBalanceChannel * channel)
 {
-  GstColorBalanceClass *klass = GST_COLOR_BALANCE_GET_CLASS (balance);
+  GstColorBalanceClass *klass;
+
+  g_return_val_if_fail (GST_IS_COLOR_BALANCE (balance), 0);
+
+  klass = GST_COLOR_BALANCE_GET_CLASS (balance);
 
   if (klass->get_value) {
     return klass->get_value (balance, channel);
@@ -197,9 +207,21 @@ gst_color_balance_get_value (GstColorBalance * balance,
 GstColorBalanceType
 gst_color_balance_get_balance_type (GstColorBalance * balance)
 {
-  GstColorBalanceClass *klass = GST_COLOR_BALANCE_GET_CLASS (balance);
+  GstColorBalanceClass *klass;
 
+  g_return_val_if_fail (GST_IS_COLOR_BALANCE (balance),
+      GST_COLOR_BALANCE_SOFTWARE);
+
+  klass = GST_COLOR_BALANCE_GET_CLASS (balance);
+
+  if (klass->get_balance_type)
+    return klass->get_balance_type (balance);
+
+#ifndef GST_REMOVE_DEPRECATED
   return klass->balance_type;
+#else
+  g_return_val_if_reached (GST_COLOR_BALANCE_SOFTWARE);
+#endif
 }
 
 /**
@@ -217,6 +239,9 @@ void
 gst_color_balance_value_changed (GstColorBalance * balance,
     GstColorBalanceChannel * channel, gint value)
 {
+
+  g_return_if_fail (GST_IS_COLOR_BALANCE (balance));
+
   g_signal_emit (G_OBJECT (balance),
       gst_color_balance_signals[VALUE_CHANGED], 0, channel, value);
 

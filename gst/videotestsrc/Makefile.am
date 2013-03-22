@@ -15,11 +15,11 @@ libgstvideotestsrc_la_LIBTOOLFLAGS = --tag=disable-static
 
 noinst_HEADERS = gstvideotestsrc.h videotestsrc.h
 
-noinst_PROGRAMS = generate_sine_table
+EXTRA_PROGRAMS = generate_sine_table
 
 generate_sine_table_SOURCES = generate_sine_table.c
 generate_sine_table_CFLAGS = $(GST_CFLAGS)
-generate_sine_table_LDADD = $(LIBM)
+generate_sine_table_LDADD = $(LIBM) $(GLIB_LIBS)
 
 Android.mk: Makefile.am $(BUILT_SOURCES)
 	androgenizer \

@@ -47,7 +47,7 @@ GST_DEBUG_CATEGORY (ffmpegcolorspace_performance);
 #define FFMPEGCSP_VIDEO_CAPS						\
   "video/x-raw-yuv, width = "GST_VIDEO_SIZE_RANGE" , "			\
   "height="GST_VIDEO_SIZE_RANGE",framerate="GST_VIDEO_FPS_RANGE","	\
-  "format= (fourcc) { I420 , NV12 , NV21 , YV12 , YUY2 , Y42B , Y444 , YUV9 , YVU9 , Y41B , Y800 , Y8 , GREY , Y16 , UYVY , YVYU , IYU1 , v308 , AYUV, A420} ;" \
+  "format= (fourcc) { I420 , NV12 , NV21 , YV12 , YUY2 , Y42B , Y444 , YUV9 , YVU9 , Y41B , Y800 , Y8 , GREY , Y16 , UYVY , YVYU , IYU1 , v308 , AYUV, A420, D420, d420, D422, d422, D444, d444} ;" \
   GST_VIDEO_CAPS_RGB";"							\
   GST_VIDEO_CAPS_BGR";"							\
   GST_VIDEO_CAPS_RGBx";"						\
@@ -341,10 +341,10 @@ gst_ffmpegcsp_base_init (gpointer klass)
 {
   GstElementClass *element_class = GST_ELEMENT_CLASS (klass);
 
-  gst_element_class_add_pad_template (element_class,
-      gst_static_pad_template_get (&gst_ffmpegcsp_src_template));
-  gst_element_class_add_pad_template (element_class,
-      gst_static_pad_template_get (&gst_ffmpegcsp_sink_template));
+  gst_element_class_add_static_pad_template (element_class,
+      &gst_ffmpegcsp_src_template);
+  gst_element_class_add_static_pad_template (element_class,
+      &gst_ffmpegcsp_sink_template);
 
   gst_element_class_set_details_simple (element_class,
       "FFMPEG Colorspace converter", "Filter/Converter/Video",
